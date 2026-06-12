@@ -1,5 +1,5 @@
 "use strict";
-/* drumlab frontend — vanilla JS, WaveSurfer 7.8.6 (waveforms) + Tone.js 14.8.49 (clock/synth) */
+/* drumlab frontend V0.2 — vanilla JS, WaveSurfer 7.8.6 (waveforms) + Tone.js 14.8.49 (clock/synth) */
 
 const $ = (id) => document.getElementById(id);
 
@@ -33,13 +33,171 @@ const CLASSES = [
 ];
 const COLORS = { kick: "#e74c3c", snare: "#f0a432", hihat: "#2ecc71", tom: "#3a9ad9", cymbal: "#a06fd6" };
 const ROLL_ORDER = ["kick", "snare", "hihat", "tom", "cymbal"]; // top -> bottom rows
+// default per-instrument synth gains (hi-hat/cymbal tamed — raw synths are piercing)
+const CLASS_GAIN_DEF = { kick: 1.0, snare: 0.85, hihat: 0.3, tom: 0.9, cymbal: 0.45 };
+const LANE_NAMES = ["input", "stem", "nodrums"];
+const LANE_CONT = { input: "wave-input", stem: "wave-stem", nodrums: "wave-nodrums" };
+const LANE_PLACEHOLDER = { input: "no input loaded", stem: "no drum stem yet", nodrums: "no demucs backing yet" };
+const LANE_COLORS = {
+  input:   { wave: "#4a6f96", prog: "#76a8d8" },
+  stem:    { wave: "#4f8f6a", prog: "#7cc79b" },
+  nodrums: { wave: "#8a7a4d", prog: "#c4ad6e" },
+};
 
 /* ------------------------------------------------------------------ */
-/* audio engine                                                        */
+/* knob component (rotary, drag-vertical / wheel / dblclick-reset)     */
+/* ------------------------------------------------------------------ */
+function createKnob(hostId, opts) {
+  const o = Object.assign({ min: 0, max: 1.5, value: 1.0, size: 38, color: "#4ea1ff", label: "", fmt: (v) => v.toFixed(2) }, opts);
+  const host = $(hostId);
+  const wrap = document.createElement("div");
+  wrap.className = "knob";
+  const canvas = document.createElement("canvas");
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = o.size * dpr;
+  canvas.height = o.size * dpr;
+  canvas.style.width = o.size + "px";
+  canvas.style.height = o.size + "px";
+  const label = document.createElement("span");
+  label.className = "knob-label";
+  label.textContent = o.label;
+  wrap.appendChild(canvas);
+  if (o.label) wrap.appendChild(label);
+  host.appendChild(wrap);
+
+  const ctx = canvas.getContext("2d");
+  const defVal = o.value;
+  let value = o.value;
+  const A0 = 0.75 * Math.PI, A1 = 2.25 * Math.PI; // 270° sweep
+
+  function draw() {
+    const s = o.size, c = s / 2, r = s / 2 - 3;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, s, s);
+    ctx.lineWidth = Math.max(2.5, s / 14);
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "#2e323b";
+    ctx.beginPath(); ctx.arc(c, c, r, A0, A1); ctx.stroke();
+    const frac = (value - o.min) / (o.max - o.min);
+    const a = A0 + frac * (A1 - A0);
+    ctx.strokeStyle = o.color;
+    ctx.beginPath(); ctx.arc(c, c, r, A0, a); ctx.stroke();
+    ctx.strokeStyle = "#d6d9e0";
+    ctx.lineWidth = Math.max(1.5, s / 22);
+    ctx.beginPath();
+    ctx.moveTo(c + Math.cos(a) * r * 0.35, c + Math.sin(a) * r * 0.35);
+    ctx.lineTo(c + Math.cos(a) * r * 0.85, c + Math.sin(a) * r * 0.85);
+    ctx.stroke();
+    wrap.title = (o.label ? o.label + ": " : "") + o.fmt(value);
+  }
+
+  function setValue(v, fire) {
+    value = Math.min(o.max, Math.max(o.min, v));
+    draw();
+    if (fire !== false && o.onChange) o.onChange(value);
+  }
+
+  let dragY = null, dragV = null;
+  canvas.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    canvas.setPointerCapture(e.pointerId);
+    dragY = e.clientY; dragV = value;
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (dragY === null) return;
+    const range = o.max - o.min;
+    const fine = e.shiftKey ? 0.25 : 1;
+    setValue(dragV + (dragY - e.clientY) * (range / 150) * fine);
+  });
+  canvas.addEventListener("pointerup", () => { dragY = null; });
+  canvas.addEventListener("pointercancel", () => { dragY = null; });
+  canvas.addEventListener("dblclick", () => setValue(defVal));
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    setValue(value + (e.deltaY < 0 ? 1 : -1) * (o.max - o.min) / 40);
+  }, { passive: false });
+
+  setValue(value, false);
+  return { get: () => value, set: setValue };
+}
+
+/* ------------------------------------------------------------------ */
+/* stereo meters (dBFS, peak hold)                                     */
+/* ------------------------------------------------------------------ */
+const meterState = new WeakMap(); // canvas -> {peaks:[l,r]}
+
+function dbToFrac(db) {
+  if (!isFinite(db)) return 0;
+  return Math.min(1, Math.max(0, (db + 60) / 60));
+}
+
+function drawStereoMeter(canvas, dbs, withScale) {
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  let st = meterState.get(canvas);
+  if (!st) { st = { peaks: [-90, -90] }; meterState.set(canvas, st); }
+  ctx.clearRect(0, 0, W, H);
+  const padB = withScale ? 11 : 0;
+  const barH = (H - padB - 6) / 2;
+  const marks = [-48, -24, -12, -6, -3, 0];
+
+  for (let ch = 0; ch < 2; ch++) {
+    const y = 2 + ch * (barH + 2);
+    const db = dbs[ch];
+    st.peaks[ch] = Math.max(db, st.peaks[ch] - 0.45); // peak fall ~27 dB/s
+    ctx.fillStyle = "#181b20";
+    ctx.fillRect(0, y, W, barH);
+    const f = dbToFrac(db);
+    const gx = (v) => dbToFrac(v) * W;
+    // green / yellow / red segments up to the level
+    const segs = [[-60, -12, "#2f9e57"], [-12, -3, "#d9a62e"], [-3, 0, "#c0463f"]];
+    for (const [a, b, col] of segs) {
+      const x0 = gx(a), x1 = Math.min(gx(b), f * W);
+      if (x1 > x0) { ctx.fillStyle = col; ctx.fillRect(x0, y, x1 - x0, barH); }
+    }
+    const pf = dbToFrac(st.peaks[ch]);
+    if (pf > 0.01) {
+      ctx.fillStyle = st.peaks[ch] > -3 ? "#ff6b61" : "#d6d9e0";
+      ctx.fillRect(pf * W - 1, y, 1.5, barH);
+    }
+  }
+  // scale ticks
+  ctx.fillStyle = "#8b919e";
+  ctx.strokeStyle = "rgba(139,145,158,0.4)";
+  ctx.font = "8px Consolas, monospace";
+  for (const m of marks) {
+    const x = dbToFrac(m) * W;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H - padB); ctx.stroke();
+    if (withScale) ctx.fillText(m === 0 ? "0" : String(m), Math.min(x + 1, W - 16), H - 2);
+  }
+}
+
+function makeTap(node) {
+  // up-mix through an explicit 2ch gain so mono sources still meter on both bars
+  let pre = node;
+  try {
+    const up = Tone.getContext().rawContext.createGain();
+    up.channelCount = 2;
+    up.channelCountMode = "explicit";
+    up.channelInterpretation = "speakers";
+    Tone.connect(node, up);
+    pre = up;
+  } catch (e) { /* fall back to direct split */ }
+  const split = new Tone.Split(2);
+  Tone.connect(pre, split);
+  const l = new Tone.Meter({ smoothing: 0.8 });
+  const r = new Tone.Meter({ smoothing: 0.8 });
+  split.connect(l, 0, 0);
+  split.connect(r, 1, 0);
+  return { get: () => [l.getValue(), r.getValue()] };
+}
+
+/* ------------------------------------------------------------------ */
+/* audio graph                                                         */
 /* ------------------------------------------------------------------ */
 const engine = {
   started: false,
-  lanes: { input: null, stem: null },   // {ws, player, gain}
+  lanes: { input: null, stem: null, nodrums: null },  // {ws, player}
   part: null,
   synths: null,
   duration: 0,
@@ -47,15 +205,31 @@ const engine = {
   tempo: null,
 };
 
-function makeSynths() {
-  const bus = new Tone.Gain(parseFloat($("gain-midi").value)).toDestination();
+const master = new Tone.Gain(1.0);
+master.connect(Tone.getDestination());
+const laneGains = {
+  input: new Tone.Gain(0.9).connect(master),
+  stem: new Tone.Gain(0.9).connect(master),
+  nodrums: new Tone.Gain(0.9).connect(master),
+};
+const midiBus = new Tone.Gain(0.8).connect(master);
+const classGains = {};
+for (const c of CLASSES) classGains[c.id] = new Tone.Gain(CLASS_GAIN_DEF[c.id]).connect(midiBus);
 
+const taps = {
+  master: makeTap(master),
+  input: makeTap(laneGains.input),
+  stem: makeTap(laneGains.stem),
+  nodrums: makeTap(laneGains.nodrums),
+};
+
+function makeSynths() {
   const kick = new Tone.MembraneSynth({
     pitchDecay: 0.04, octaves: 6,
     envelope: { attack: 0.001, decay: 0.35, sustain: 0 },
-  }).connect(bus);
+  }).connect(classGains.kick);
 
-  const snareBP = new Tone.Filter(1800, "bandpass").connect(bus);
+  const snareBP = new Tone.Filter(1800, "bandpass").connect(classGains.snare);
   const snare = new Tone.NoiseSynth({
     noise: { type: "white" },
     envelope: { attack: 0.001, decay: 0.13, sustain: 0 },
@@ -64,17 +238,17 @@ function makeSynths() {
   const hihat = new Tone.MetalSynth({
     envelope: { attack: 0.001, decay: 0.06, release: 0.02 },
     harmonicity: 5.1, modulationIndex: 32, resonance: 6000, octaves: 1.2,
-  }).connect(bus);
+  }).connect(classGains.hihat);
 
   const tom = new Tone.MembraneSynth({
     pitchDecay: 0.06, octaves: 3,
     envelope: { attack: 0.001, decay: 0.25, sustain: 0 },
-  }).connect(bus);
+  }).connect(classGains.tom);
 
   const cymbal = new Tone.MetalSynth({
     envelope: { attack: 0.001, decay: 1.1, release: 0.4 },
     harmonicity: 4.1, modulationIndex: 40, resonance: 5000, octaves: 1.5,
-  }).connect(bus);
+  }).connect(classGains.cymbal);
 
   function metalHit(synth, freq, dur, time, vel) {
     try { synth.triggerAttackRelease(freq, dur, time, vel); }
@@ -82,7 +256,6 @@ function makeSynths() {
   }
 
   return {
-    bus,
     trigger(cls, time) {
       try {
         if (cls === "kick") kick.triggerAttackRelease("C1", 0.25, time);
@@ -95,34 +268,32 @@ function makeSynths() {
   };
 }
 
+/* lanes ---------------------------------------------------------------- */
 function disposeLane(name) {
   const lane = engine.lanes[name];
   if (!lane) return;
   try { lane.ws.destroy(); } catch (e) {}
   try { lane.player.unsync(); lane.player.dispose(); } catch (e) {}
-  try { lane.gain.dispose(); } catch (e) {}
   engine.lanes[name] = null;
-  const cont = $(name === "input" ? "wave-input" : "wave-stem");
-  cont.innerHTML = '<div class="placeholder">' + (name === "input" ? "no input loaded" : "no drum stem yet") + "</div>";
+  $(LANE_CONT[name]).innerHTML = '<div class="placeholder">' + LANE_PLACEHOLDER[name] + "</div>";
 }
 
 async function loadLane(name, url) {
   disposeLane(name);
-  const cont = $(name === "input" ? "wave-input" : "wave-stem");
+  const cont = $(LANE_CONT[name]);
   cont.innerHTML = "";
 
-  const gain = new Tone.Gain(parseFloat($(name === "input" ? "gain-input" : "gain-stem").value)).toDestination();
   const player = new Tone.Player();
   await player.load(url);
-  player.connect(gain);
+  player.connect(laneGains[name]);
   player.sync().start(0);
 
   const ws = WaveSurfer.create({
     container: cont,
     url: url,
-    height: Math.max(60, cont.clientHeight - 4),
-    waveColor: name === "input" ? "#4a6f96" : "#4f8f6a",
-    progressColor: name === "input" ? "#76a8d8" : "#7cc79b",
+    height: Math.max(56, cont.clientHeight - 4),
+    waveColor: LANE_COLORS[name].wave,
+    progressColor: LANE_COLORS[name].prog,
     cursorColor: "#e8e8e8",
     cursorWidth: 1,
     normalize: true,
@@ -134,7 +305,7 @@ async function loadLane(name, url) {
   });
   ws.on("interaction", (t) => seekAll(t));
   ws.on("scroll", () => mirrorScroll(name));
-  engine.lanes[name] = { ws, player, gain };
+  engine.lanes[name] = { ws, player };
 
   recomputeDuration();
   setLog(name + " audio loaded (" + player.buffer.duration.toFixed(1) + "s)");
@@ -142,7 +313,7 @@ async function loadLane(name, url) {
 
 function recomputeDuration() {
   let d = 0;
-  for (const k of ["input", "stem"]) {
+  for (const k of LANE_NAMES) {
     const lane = engine.lanes[k];
     if (lane && lane.player.buffer) d = Math.max(d, lane.player.buffer.duration);
   }
@@ -153,9 +324,10 @@ function recomputeDuration() {
     }
   }
   engine.duration = d;
+  applyZoom();
 }
 
-/* transport ---------------------------------------------------------- */
+/* transport ------------------------------------------------------------ */
 async function ensureAudio() {
   if (!engine.started) {
     await Tone.start();
@@ -174,6 +346,13 @@ async function togglePlay() {
   renderPlayButton();
 }
 
+function stopTransport() {
+  Tone.Transport.pause();
+  Tone.Transport.seconds = 0;
+  updateCursors(0);
+  renderPlayButton();
+}
+
 function seekAll(t) {
   t = Math.max(0, engine.duration ? Math.min(t, engine.duration) : t);
   const wasPlaying = Tone.Transport.state === "started";
@@ -184,14 +363,17 @@ function seekAll(t) {
 }
 
 function updateCursors(t) {
-  for (const k of ["input", "stem"]) {
+  for (const k of LANE_NAMES) {
     const lane = engine.lanes[k];
     if (lane) { try { lane.ws.setTime(t); } catch (e) {} }
   }
 }
 
 function renderPlayButton() {
-  $("btn-play").innerHTML = Tone.Transport.state === "started" ? "&#10074;&#10074;" : "&#9654;";
+  const playing = Tone.Transport.state === "started";
+  const btn = $("btn-play");
+  btn.innerHTML = playing ? "&#10074;&#10074;" : "&#9654;";
+  btn.classList.toggle("playing", playing);
 }
 
 function fmtTime(t) {
@@ -200,7 +382,59 @@ function fmtTime(t) {
   return m + ":" + s.toFixed(3).padStart(6, "0");
 }
 
-/* scroll + zoom sync -------------------------------------------------- */
+/* loop ------------------------------------------------------------------ */
+const loop = { active: false, start: 0, end: 0, preview: null };
+
+function setLoop(a, b) {
+  if (b < a) { const x = a; a = b; b = x; }
+  a = Math.max(0, a);
+  b = Math.min(engine.duration || b, b);
+  if (b - a < 0.05) return;
+  loop.active = true;
+  loop.start = a;
+  loop.end = b;
+  try {
+    Tone.Transport.setLoopPoints(a, b);
+    Tone.Transport.loop = true;
+  } catch (e) {}
+  $("loop-chip").classList.remove("hidden");
+  $("loop-range").textContent = a.toFixed(2) + "–" + b.toFixed(2) + "s";
+}
+
+function clearLoop() {
+  loop.active = false;
+  loop.preview = null;
+  try { Tone.Transport.loop = false; } catch (e) {}
+  $("loop-chip").classList.add("hidden");
+}
+
+$("loop-clear").addEventListener("click", clearLoop);
+
+function ensureOverlay(bodyEl) {
+  let ov = bodyEl.querySelector(":scope > .loop-overlay");
+  if (!ov) {
+    ov = document.createElement("div");
+    ov.className = "loop-overlay";
+    bodyEl.appendChild(ov);
+  }
+  return ov;
+}
+
+function updateLoopOverlays() {
+  const region = loop.preview || (loop.active ? [loop.start, loop.end] : null);
+  const bodies = [$("wave-input"), $("wave-stem"), $("wave-nodrums"), $("roll-wrap")];
+  for (const body of bodies) {
+    const ov = ensureOverlay(body);
+    if (!region) { ov.style.display = "none"; continue; }
+    const x0 = region[0] * engine.pxPerSec - roll.scrollPx;
+    const x1 = region[1] * engine.pxPerSec - roll.scrollPx;
+    ov.style.display = "block";
+    ov.style.left = Math.min(x0, x1) + "px";
+    ov.style.width = Math.abs(x1 - x0) + "px";
+  }
+}
+
+/* scroll + zoom sync ----------------------------------------------------- */
 let syncingScroll = false;
 
 function mirrorScroll(fromName) {
@@ -209,7 +443,7 @@ function mirrorScroll(fromName) {
   if (!src || typeof src.ws.getScroll !== "function") return;
   syncingScroll = true;
   const px = src.ws.getScroll();
-  for (const k of ["input", "stem"]) {
+  for (const k of LANE_NAMES) {
     if (k === fromName) continue;
     const lane = engine.lanes[k];
     if (lane && typeof lane.ws.setScroll === "function") {
@@ -220,11 +454,16 @@ function mirrorScroll(fromName) {
   syncingScroll = false;
 }
 
+function maxScroll() {
+  const w = $("roll-wrap").clientWidth || 800;
+  return Math.max(0, (engine.duration || 0) * engine.pxPerSec - w);
+}
+
 function setScrollAll(px) {
-  px = Math.max(0, px);
+  px = Math.min(maxScroll(), Math.max(0, px));
   roll.scrollPx = px;
   syncingScroll = true;
-  for (const k of ["input", "stem"]) {
+  for (const k of LANE_NAMES) {
     const lane = engine.lanes[k];
     if (lane && typeof lane.ws.setScroll === "function") {
       try { lane.ws.setScroll(px); } catch (e) {}
@@ -233,13 +472,36 @@ function setScrollAll(px) {
   syncingScroll = false;
 }
 
-function zoomToSlider() {
-  const v = parseFloat($("zoom").value);
-  engine.pxPerSec = Math.min(1200, 4 * Math.pow(2, v / 12));
-  for (const k of ["input", "stem"]) {
+function fitPx() {
+  const w = $("roll-wrap").clientWidth || 800;
+  return w / Math.max(0.001, engine.duration || 30);
+}
+
+function applyZoom() {
+  const v = parseFloat($("zoom").value) / 100; // 0 = whole file fits, 1 = max
+  const fit = fitPx();
+  const maxPx = Math.max(fit * 1.001, 800);
+  engine.pxPerSec = fit * Math.pow(maxPx / fit, v);
+  for (const k of LANE_NAMES) {
     const lane = engine.lanes[k];
     if (lane) { try { lane.ws.zoom(engine.pxPerSec); } catch (e) {} }
   }
+  roll.scrollPx = Math.min(roll.scrollPx, maxScroll());
+  drawRoll();
+}
+
+$("zoom").addEventListener("input", applyZoom);
+$("zoom-in").addEventListener("click", () => { $("zoom").value = Math.min(100, parseFloat($("zoom").value) + 8); applyZoom(); });
+$("zoom-out").addEventListener("click", () => { $("zoom").value = Math.max(0, parseFloat($("zoom").value) - 8); applyZoom(); });
+window.addEventListener("resize", applyZoom);
+
+/* wheel scrubs all lanes left/right */
+for (const id of ["wave-input", "wave-stem", "wave-nodrums", "roll-wrap"]) {
+  $(id).addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    setScrollAll(roll.scrollPx + d);
+  }, { passive: false });
 }
 
 /* ------------------------------------------------------------------ */
@@ -272,7 +534,6 @@ function drawRoll() {
   const t0 = roll.scrollPx / px;
   const t1 = (roll.scrollPx + W) / px;
 
-  // row separators + labels
   ctx.font = "10px Consolas, monospace";
   for (let i = 0; i < rows; i++) {
     const y = i * rowH;
@@ -282,7 +543,6 @@ function drawRoll() {
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
   }
 
-  // second gridlines when zoomed in enough
   if (px > 24) {
     ctx.strokeStyle = "rgba(255,255,255,0.05)";
     for (let s = Math.ceil(t0); s <= t1; s++) {
@@ -291,7 +551,6 @@ function drawRoll() {
     }
   }
 
-  // hits
   if (roll.events) {
     const markW = Math.max(2, Math.min(6, px / 30));
     for (let i = 0; i < rows; i++) {
@@ -300,21 +559,19 @@ function drawRoll() {
       ctx.fillStyle = COLORS[cls];
       const y = i * rowH + rowH * 0.18;
       const h = rowH * 0.64;
-      let lo = lowerBound(times, t0 - 0.05);
+      const lo = lowerBound(times, t0 - 0.05);
       for (let j = lo; j < times.length && times[j] <= t1 + 0.05; j++) {
         ctx.fillRect(times[j] * px - roll.scrollPx - markW / 2, y, markW, h);
       }
     }
   }
 
-  // row labels (fixed at left)
   for (let i = 0; i < rows; i++) {
     const cls = ROLL_ORDER[i];
     ctx.fillStyle = COLORS[cls];
     ctx.fillText(cls, 4, i * rowH + 11);
   }
 
-  // playhead
   const t = Tone.Transport.seconds;
   const x = t * px - roll.scrollPx;
   if (x >= 0 && x <= W) {
@@ -332,15 +589,91 @@ function lowerBound(arr, v) {
   return lo;
 }
 
-$("roll-wrap").addEventListener("click", (e) => {
-  const t = (roll.scrollPx + e.offsetX) / engine.pxPerSec;
-  seekAll(t);
+/* roll pointer: click = seek (or edit), drag = loop selection */
+let rollDrag = null;
+
+$("roll-wrap").addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  $("roll-wrap").setPointerCapture(e.pointerId);
+  rollDrag = { x0: e.offsetX, y0: e.offsetY, moved: false };
 });
-$("roll-wrap").addEventListener("wheel", (e) => {
-  e.preventDefault();
-  const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
-  setScrollAll(roll.scrollPx + d);
-}, { passive: false });
+
+$("roll-wrap").addEventListener("pointermove", (e) => {
+  if (!rollDrag) return;
+  if (Math.abs(e.offsetX - rollDrag.x0) > 5) rollDrag.moved = true;
+  if (rollDrag.moved) {
+    const tA = (roll.scrollPx + rollDrag.x0) / engine.pxPerSec;
+    const tB = (roll.scrollPx + e.offsetX) / engine.pxPerSec;
+    loop.preview = [Math.min(tA, tB), Math.max(tA, tB)];
+  }
+});
+
+$("roll-wrap").addEventListener("pointerup", (e) => {
+  if (!rollDrag) return;
+  const drag = rollDrag;
+  rollDrag = null;
+  loop.preview = null;
+  if (drag.moved) {
+    const tA = (roll.scrollPx + drag.x0) / engine.pxPerSec;
+    const tB = (roll.scrollPx + e.offsetX) / engine.pxPerSec;
+    setLoop(tA, tB);
+    return;
+  }
+  if ($("midi-edit").checked) toggleNote(e.offsetX, e.offsetY);
+  else seekAll((roll.scrollPx + e.offsetX) / engine.pxPerSec);
+});
+
+$("roll-wrap").addEventListener("pointercancel", () => { rollDrag = null; loop.preview = null; });
+
+/* edit mode -------------------------------------------------------------- */
+function toggleNote(x, y) {
+  if (!roll.events) {
+    setLog("nothing to edit yet — run ADTOF first", true);
+    return;
+  }
+  const wrap = $("roll-wrap");
+  const rowH = wrap.clientHeight / ROLL_ORDER.length;
+  const row = Math.min(ROLL_ORDER.length - 1, Math.max(0, Math.floor(y / rowH)));
+  const cls = ROLL_ORDER[row];
+  const t = (roll.scrollPx + x) / engine.pxPerSec;
+  const tol = 6 / engine.pxPerSec;
+  const arr = roll.events[cls];
+  const j = lowerBound(arr, t);
+  let hit = -1;
+  if (j < arr.length && Math.abs(arr[j] - t) <= tol) hit = j;
+  else if (j > 0 && Math.abs(arr[j - 1] - t) <= tol) hit = j - 1;
+  if (hit >= 0) {
+    arr.splice(hit, 1);
+    setLog("removed " + cls + " @ " + t.toFixed(3) + "s");
+  } else {
+    arr.splice(j, 0, Math.round(t * 1e5) / 1e5);
+    if (engine.started) engine.synths.trigger(cls, Tone.now());
+    setLog("added " + cls + " @ " + t.toFixed(3) + "s");
+  }
+  rebuildPart(roll.events);
+  updateCounts();
+  drawRoll();
+  pushEventsDebounced();
+}
+
+let pushTimer = null;
+function pushEventsDebounced() {
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(async () => {
+    try {
+      const r = await postJSON("/api/events/update", { events: roll.events });
+      lastPickRev = r.rev;
+    } catch (e) { setLog("edit sync: " + e.message, true); }
+  }, 300);
+}
+
+function updateCounts() {
+  if (!roll.events) return;
+  for (const c of CLASSES) {
+    const el = $("count-" + c.id);
+    if (el) el.textContent = (roll.events[c.id] || []).length + "×";
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* MIDI part                                                           */
@@ -361,15 +694,12 @@ async function fetchEvents() {
   $("tempo-display").textContent = "~" + d.tempo.toFixed(1) + " bpm";
   rebuildPart(d.events);
   recomputeDuration();
-  for (const c of CLASSES) {
-    const el = $("count-" + c.id);
-    if (el) el.textContent = (d.events[c.id] || []).length + "×";
-  }
+  updateCounts();
   drawRoll();
 }
 
 /* ------------------------------------------------------------------ */
-/* controls: sliders                                                   */
+/* controls: threshold sliders                                         */
 /* ------------------------------------------------------------------ */
 function buildSliders() {
   const host = $("sliders");
@@ -421,20 +751,69 @@ async function runPick() {
 }
 
 /* ------------------------------------------------------------------ */
-/* controls: upload / run / stop                                       */
+/* controls: upload / mode / run / stop                                */
 /* ------------------------------------------------------------------ */
 function getDevice() { return document.querySelector('input[name="device"]:checked').value; }
 function getMode() { return document.querySelector('input[name="entry"]:checked').value; }
+
+function applyMode() {
+  const direct = getMode() === "direct";
+  $("panel-demucs").classList.toggle("disabled", direct);
+  $("lane-stem").classList.toggle("hidden", direct);
+  $("lane-nodrums").classList.toggle("hidden", direct);
+}
+document.querySelectorAll('input[name="entry"]').forEach((r) => r.addEventListener("change", applyMode));
+
+function fmtSize(bytes) {
+  if (bytes >= 1 << 20) return (bytes / (1 << 20)).toFixed(1) + " MB";
+  return Math.round(bytes / 1024) + " KB";
+}
+
+function fmtDur(sec) {
+  const m = Math.floor(sec / 60), s = Math.round(sec - m * 60);
+  return m + ":" + String(s).padStart(2, "0");
+}
+
+function renderInputMeta(input) {
+  const dz = $("dropzone");
+  if (!input) {
+    $("meta-display").textContent = "no file loaded";
+    $("file-name").innerHTML = "&nbsp;";
+    $("file-meta").innerHTML = "&nbsp;";
+    dz.classList.remove("has-art");
+    dz.style.backgroundImage = "";
+    return;
+  }
+  const chs = input.channels === 1 ? "mono" : input.channels === 2 ? "stereo" : input.channels + "ch";
+  const parts = [
+    (input.ext || "?").toUpperCase(),
+    (input.samplerate / 1000).toFixed(1).replace(/\.0$/, "") + " kHz",
+    chs,
+    fmtDur(input.duration),
+    fmtSize(input.size || 0),
+  ];
+  $("meta-display").textContent = input.name + "  ·  " + parts.join(" · ");
+  $("file-name").textContent = input.name;
+  $("file-meta").textContent = parts.join(" · ");
+  if (input.art) {
+    dz.classList.add("has-art");
+    dz.style.backgroundImage = "url(/api/art?v=" + input.id + ")";
+  } else {
+    dz.classList.remove("has-art");
+    dz.style.backgroundImage = "";
+  }
+}
 
 async function doUpload(file) {
   if (!file) return;
   $("file-name").textContent = "uploading + converting …";
   try {
-    const r = await api("/api/upload", { method: "POST", body: (() => { const fd = new FormData(); fd.append("file", file); return fd; })() });
-    $("file-name").textContent = r.input.name + " · " + r.input.duration.toFixed(1) + "s";
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await api("/api/upload", { method: "POST", body: fd });
     setLog("uploaded " + r.input.name);
   } catch (e) {
-    $("file-name").textContent = "";
+    $("file-name").innerHTML = "&nbsp;";
     setLog("upload failed: " + e.message, true);
   }
 }
@@ -476,12 +855,6 @@ $("ad-run").addEventListener("click", async () => {
 });
 $("ad-stop").addEventListener("click", () => postJSON("/api/adtof/stop", {}).catch(() => {}));
 
-document.querySelectorAll('input[name="entry"]').forEach((r) =>
-  r.addEventListener("change", () => {
-    $("panel-demucs").classList.toggle("disabled", getMode() === "direct");
-  })
-);
-
 /* downloads */
 function bindDownload(btnId, kind) {
   $(btnId).addEventListener("click", () => {
@@ -493,23 +866,40 @@ bindDownload("dl-midi", "midi");
 bindDownload("dl-midi-quant", "midi_quant");
 bindDownload("dl-musicxml", "musicxml");
 
-/* gains */
-$("gain-input").addEventListener("input", (e) => {
-  const lane = engine.lanes.input;
-  if (lane) lane.gain.gain.value = parseFloat(e.target.value);
-});
-$("gain-stem").addEventListener("input", (e) => {
-  const lane = engine.lanes.stem;
-  if (lane) lane.gain.gain.value = parseFloat(e.target.value);
-});
-$("gain-midi").addEventListener("input", (e) => {
-  if (engine.synths) engine.synths.bus.gain.value = parseFloat(e.target.value);
-});
+/* knobs */
+const knobs = {
+  master: createKnob("knob-master", {
+    label: "master", size: 36, value: 1.0,
+    onChange: (v) => { master.gain.value = v; },
+  }),
+  input: createKnob("knob-input", {
+    label: "gain", size: 40, value: 0.9,
+    onChange: (v) => { laneGains.input.gain.value = v; },
+  }),
+  stem: createKnob("knob-stem", {
+    label: "gain", size: 40, value: 0.9,
+    onChange: (v) => { laneGains.stem.gain.value = v; },
+  }),
+  nodrums: createKnob("knob-nodrums", {
+    label: "gain", size: 40, value: 0.9,
+    onChange: (v) => { laneGains.nodrums.gain.value = v; },
+  }),
+  midi: createKnob("knob-midi", {
+    label: "midi", size: 36, value: 0.8,
+    onChange: (v) => { midiBus.gain.value = v; },
+  }),
+};
+for (const c of CLASSES) {
+  knobs[c.id] = createKnob("knob-" + c.id, {
+    label: c.label.slice(0, 3).toLowerCase(), size: 24, value: CLASS_GAIN_DEF[c.id],
+    color: COLORS[c.id],
+    onChange: (v) => { classGains[c.id].gain.value = v; },
+  });
+}
 
 /* transport buttons + keyboard */
 $("btn-play").addEventListener("click", togglePlay);
-$("btn-rewind").addEventListener("click", () => seekAll(0));
-$("zoom").addEventListener("input", zoomToSlider);
+$("btn-stop").addEventListener("click", stopTransport);
 document.addEventListener("keydown", (e) => {
   if (e.code === "Space" && !["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) {
     e.preventDefault();
@@ -559,7 +949,9 @@ async function poll(fast) {
       roll.events = null;
       if (engine.part) { try { engine.part.dispose(); } catch (e) {} engine.part = null; }
       disposeLane("stem");
-      $("file-name").textContent = s.input.name + " · " + s.input.duration.toFixed(1) + "s";
+      disposeLane("nodrums");
+      clearLoop();
+      renderInputMeta(s.input);
       $("tempo-display").textContent = "";
       seekAll(0);
       loadLane("input", "/api/audio/input?v=" + s.input.id).catch((e) => setLog("waveform: " + e.message, true));
@@ -567,6 +959,9 @@ async function poll(fast) {
     if (s.stem && s.stem.key !== lastStemKey) {
       lastStemKey = s.stem.key;
       loadLane("stem", "/api/audio/stem?v=" + s.stem.key).catch((e) => setLog("waveform: " + e.message, true));
+      if (s.stem.nodrums) {
+        loadLane("nodrums", "/api/audio/nodrums?v=" + s.stem.key).catch((e) => setLog("waveform: " + e.message, true));
+      }
     }
     if (s.pick && s.pick.rev !== lastPickRev) {
       lastPickRev = s.pick.rev;
@@ -597,20 +992,27 @@ function raf() {
   $("time-display").textContent = fmtTime(t);
   if (Tone.Transport.state === "started") {
     updateCursors(t);
-    if (engine.duration && t >= engine.duration) {
+    if (!loop.active && engine.duration && t >= engine.duration) {
       Tone.Transport.pause();
       Tone.Transport.seconds = engine.duration;
     }
-    renderPlayButton();
   }
+  renderPlayButton();
   drawRoll();
+  updateLoopOverlays();
+
+  drawStereoMeter($("master-meter"), taps.master.get(), true);
+  for (const k of LANE_NAMES) {
+    if (engine.lanes[k]) drawStereoMeter($("meter-" + k), taps[k].get(), false);
+  }
   requestAnimationFrame(raf);
 }
 
 /* init */
 buildSliders();
 engine.synths = makeSynths();
-zoomToSlider();
+applyMode();
+applyZoom();
 new ResizeObserver(() => drawRoll()).observe($("roll-wrap"));
 poll(true);
 requestAnimationFrame(raf);

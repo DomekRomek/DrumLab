@@ -13,14 +13,23 @@
 <header>
   <h1>drumlab</h1>
   <div id="transport">
-    <button id="btn-play" title="play/pause (space)">&#9654;</button>
-    <button id="btn-rewind" title="back to start">&#9209;</button>
+    <button id="btn-play" class="t-play" title="play/pause (space)">&#9654;</button>
+    <button id="btn-stop" class="t-stop" title="stop &amp; rewind">&#9632;</button>
     <span id="time-display">0:00.000</span>
-    <span id="tempo-display" class="hint"></span>
+  </div>
+  <div id="meta-bar">
+    <span id="meta-display" class="hint">no file loaded</span>
+    <span id="tempo-display"></span>
+    <span id="loop-chip" class="hidden">loop <span id="loop-range"></span> <button id="loop-clear" title="clear loop">&#10005;</button></span>
   </div>
   <div id="zoom-wrap">
-    <label class="hint">zoom</label>
-    <input type="range" id="zoom" min="0" max="100" value="40">
+    <button id="zoom-out" class="zoom-btn" title="zoom out">&minus;</button>
+    <input type="range" id="zoom" min="0" max="100" value="0">
+    <button id="zoom-in" class="zoom-btn" title="zoom in">+</button>
+  </div>
+  <div id="master-wrap">
+    <div id="knob-master"></div>
+    <canvas id="master-meter" width="190" height="34"></canvas>
   </div>
 </header>
 
@@ -28,17 +37,23 @@
 
   <div class="panel" id="panel-input">
     <h2>input</h2>
-    <div class="row" id="entry-sel">
-      <label><input type="radio" name="entry" value="demucs" checked> Demucs <span class="hint">(full song)</span></label>
-      <label><input type="radio" name="entry" value="direct"> ADTOF-direct <span class="hint">(drum audio)</span></label>
-    </div>
-    <div id="dropzone">drop audio here<br><span class="hint">or click to browse &middot; wav / mp3 / flac / m4a</span></div>
-    <input type="file" id="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,.aiff,.opus" hidden>
-    <div id="file-name" class="hint"></div>
-    <div class="row">
-      <span class="hint">device</span>
-      <label><input type="radio" name="device" value="cuda" checked> CUDA</label>
-      <label><input type="radio" name="device" value="cpu"> CPU</label>
+    <div class="input-flex">
+      <div id="dropzone" title="drop audio or click to browse">
+        <span id="dz-text">drop audio<br><span class="hint">or click &middot; wav mp3 flac m4a</span></span>
+      </div>
+      <input type="file" id="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,.aiff,.opus" hidden>
+      <div class="input-right">
+        <div class="seg" id="entry-sel">
+          <label><input type="radio" name="entry" value="demucs" checked><span>Demucs</span></label>
+          <label><input type="radio" name="entry" value="direct"><span>ADTOF-direct</span></label>
+        </div>
+        <div id="file-name" class="hint">&nbsp;</div>
+        <div id="file-meta" class="hint">&nbsp;</div>
+        <div class="seg" id="device-sel">
+          <label><input type="radio" name="device" value="cuda" checked><span>CUDA</span></label>
+          <label><input type="radio" name="device" value="cpu"><span>CPU</span></label>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -110,24 +125,47 @@
 </section>
 
 <section id="lanes">
-  <div class="lane">
+  <div class="lane" id="lane-input">
     <div class="side">
       <span class="lane-name">input</span>
-      <input type="range" class="gain" id="gain-input" min="0" max="1.5" step="0.01" value="0.9" title="input gain">
+      <div class="knob-slot" id="knob-input"></div>
+      <canvas class="lane-meter" id="meter-input" width="120" height="22"></canvas>
     </div>
     <div class="body" id="wave-input"><div class="placeholder">no input loaded</div></div>
   </div>
-  <div class="lane">
+  <div class="lane" id="lane-stem">
     <div class="side">
-      <span class="lane-name">stem</span>
-      <input type="range" class="gain" id="gain-stem" min="0" max="1.5" step="0.01" value="0.9" title="stem gain">
+      <span class="lane-name">drums</span>
+      <div class="knob-slot" id="knob-stem"></div>
+      <canvas class="lane-meter" id="meter-stem" width="120" height="22"></canvas>
     </div>
     <div class="body" id="wave-stem"><div class="placeholder">no drum stem yet</div></div>
   </div>
-  <div class="lane">
+  <div class="lane" id="lane-nodrums">
     <div class="side">
-      <span class="lane-name">midi</span>
-      <input type="range" class="gain" id="gain-midi" min="0" max="1.5" step="0.01" value="0.8" title="midi synth gain">
+      <span class="lane-name">no drums</span>
+      <div class="knob-slot" id="knob-nodrums"></div>
+      <canvas class="lane-meter" id="meter-nodrums" width="120" height="22"></canvas>
+    </div>
+    <div class="body" id="wave-nodrums"><div class="placeholder">no demucs backing yet</div></div>
+  </div>
+  <div class="lane" id="lane-midi">
+    <div class="side midi-side">
+      <div class="midi-head">
+        <span class="lane-name">midi</span>
+        <label class="edit-toggle" title="click on the roll to add a hit in that row; click an existing hit to delete it. Edits persist into downloads until the next re-pick.">
+          <input type="checkbox" id="midi-edit"> edit
+        </label>
+      </div>
+      <div class="midi-knobs">
+        <div class="knob-slot" id="knob-midi"></div>
+        <div class="knob-slot mini" id="knob-kick"></div>
+        <div class="knob-slot mini" id="knob-snare"></div>
+        <div class="knob-slot mini" id="knob-hihat"></div>
+        <div class="knob-slot mini" id="knob-tom"></div>
+        <div class="knob-slot mini" id="knob-cymbal"></div>
+      </div>
+      <span class="hint" id="loop-hint">drag roll to loop</span>
     </div>
     <div class="body" id="roll-wrap"><canvas id="roll"></canvas></div>
   </div>

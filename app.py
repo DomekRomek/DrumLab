@@ -193,7 +193,8 @@ def stream_subprocess(job: Job, cmd: list, on_line=None) -> int:
         if job.cancelled:  # stop raced with start
             kill_tree(proc)
     partial = ""
-    pct_re = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+    # match tqdm-style " 42%|####  " only, so stray percentages in logs don't fake progress
+    pct_re = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%\s*\|")
     while True:
         chunk = proc.stdout.read(4096)
         if not chunk:
@@ -253,8 +254,10 @@ def demucs_thread(params: dict) -> None:
         stem_path = STEMS / key / "drums.wav"
 
         if stem_path.exists():
+            nodrums_cached = stem_path.parent / "no_drums.wav"
             with STATE_LOCK:
-                STATE["stem"] = {"key": key, "wav": str(stem_path)}
+                STATE["stem"] = {"key": key, "wav": str(stem_path),
+                                 "nodrums": str(nodrums_cached) if nodrums_cached.exists() else None}
             job.progress = 1.0
             job.finish("done", "reused cached stem (same input + params)")
             return
@@ -291,9 +294,14 @@ def demucs_thread(params: dict) -> None:
             return
         stem_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(found), str(stem_path))
+        found_nd = next(tmp.rglob("no_drums.wav"), None)
+        nodrums_path = stem_path.parent / "no_drums.wav"
+        if found_nd is not None:
+            shutil.move(str(found_nd), str(nodrums_path))
         shutil.rmtree(tmp, ignore_errors=True)
         with STATE_LOCK:
-            STATE["stem"] = {"key": key, "wav": str(stem_path)}
+            STATE["stem"] = {"key": key, "wav": str(stem_path),
+                             "nodrums": str(nodrums_path) if nodrums_path.exists() else None}
         job.progress = 1.0
         job.finish("done", "drum stem ready")
     except Exception as e:  # noqa: BLE001
@@ -533,10 +541,24 @@ def upload(file: UploadFile = File(...)):
 
     info = sf.info(str(wav))
     duration = float(info.frames) / float(info.samplerate)
+
+    # embedded album art (attached-pic stream), if any
+    art = UPLOADS / f"{sha}_art.jpg"
+    if not art.exists():
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(orig), "-an", "-map", "0:v:0", "-frames:v", "1", str(art)],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=60,
+        )
+        if r.returncode != 0 or not art.exists() or art.stat().st_size == 0:
+            art.unlink(missing_ok=True)
+
     with STATE_LOCK:
         STATE["input"] = {
             "id": sha, "name": file.filename, "stem_name": safe_stem,
             "wav": str(wav), "duration": duration,
+            "samplerate": int(info.samplerate), "channels": int(info.channels),
+            "ext": suffix.lstrip(".").lower(), "size": len(data),
+            "art": art.exists(),
         }
         STATE["stem"] = None
         STATE["acts"] = None
@@ -594,7 +616,8 @@ def get_state():
     pick = STATE["pick"]
     return {
         "input": STATE["input"],
-        "stem": {"key": STATE["stem"]["key"]} if STATE["stem"] else None,
+        "stem": {"key": STATE["stem"]["key"],
+                 "nodrums": bool(STATE["stem"].get("nodrums"))} if STATE["stem"] else None,
         "acts": STATE["acts"],
         "pick": {"rev": pick["rev"], "thresholds": pick["thresholds"],
                  "fps": pick["fps"], "counts": pick["counts"]} if pick else None,
@@ -616,7 +639,40 @@ def get_audio(which: str):
         return FileResponse(STATE["input"]["wav"], media_type="audio/wav")
     if which == "stem" and STATE["stem"]:
         return FileResponse(STATE["stem"]["wav"], media_type="audio/wav")
+    if which == "nodrums" and STATE["stem"] and STATE["stem"].get("nodrums"):
+        return FileResponse(STATE["stem"]["nodrums"], media_type="audio/wav")
     raise HTTPException(404, f"no {which} audio available")
+
+
+@app.get("/api/art")
+def get_art():
+    if STATE["input"] and STATE["input"].get("art"):
+        return FileResponse(UPLOADS / f"{STATE['input']['id']}_art.jpg", media_type="image/jpeg")
+    raise HTTPException(404, "no album art")
+
+
+@app.post("/api/events/update")
+def events_update(params: dict):
+    """Replace the current hit list with manually edited events (MIDI edit mode).
+
+    Edits live in the pick state, so downloads include them; the next
+    re-pick / ADTOF run overwrites them.
+    """
+    if not STATE["pick"]:
+        raise HTTPException(409, "no transcription to edit -- run ADTOF first")
+    raw = params.get("events") or {}
+    events = {}
+    for cls in CH_NAMES:
+        times = raw.get(cls, [])
+        if not isinstance(times, list):
+            raise HTTPException(400, f"bad events for {cls}")
+        events[cls] = sorted(round(float(t), 5) for t in times if float(t) >= 0)
+    with STATE_LOCK:
+        PICK_REV[0] += 1
+        STATE["pick"]["rev"] = PICK_REV[0]
+        STATE["pick"]["events"] = events
+        STATE["pick"]["counts"] = {n: len(v) for n, v in events.items()}
+    return {"rev": PICK_REV[0], "counts": STATE["pick"]["counts"]}
 
 
 @app.get("/api/download/{kind}")
