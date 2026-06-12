@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>drumlab</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/vendor/wavesurfer.min.js"></script>
+<script src="/static/vendor/Tone.min.js"></script>
+</head>
+<body>
+
+<header>
+  <h1>drumlab</h1>
+  <div id="transport">
+    <button id="btn-play" title="play/pause (space)">&#9654;</button>
+    <button id="btn-rewind" title="back to start">&#9209;</button>
+    <span id="time-display">0:00.000</span>
+    <span id="tempo-display" class="hint"></span>
+  </div>
+  <div id="zoom-wrap">
+    <label class="hint">zoom</label>
+    <input type="range" id="zoom" min="0" max="100" value="40">
+  </div>
+</header>
+
+<section id="controls">
+
+  <div class="panel" id="panel-input">
+    <h2>input</h2>
+    <div class="row" id="entry-sel">
+      <label><input type="radio" name="entry" value="demucs" checked> Demucs <span class="hint">(full song)</span></label>
+      <label><input type="radio" name="entry" value="direct"> ADTOF-direct <span class="hint">(drum audio)</span></label>
+    </div>
+    <div id="dropzone">drop audio here<br><span class="hint">or click to browse &middot; wav / mp3 / flac / m4a</span></div>
+    <input type="file" id="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,.aiff,.opus" hidden>
+    <div id="file-name" class="hint"></div>
+    <div class="row">
+      <span class="hint">device</span>
+      <label><input type="radio" name="device" value="cuda" checked> CUDA</label>
+      <label><input type="radio" name="device" value="cpu"> CPU</label>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-demucs">
+    <h2>1 &middot; demucs <span class="chip" id="dm-status">idle</span></h2>
+    <div class="row">
+      <label>model
+        <select id="dm-model">
+          <option>htdemucs</option>
+          <option>htdemucs_ft</option>
+          <option>mdx_extra</option>
+          <option>mdx_extra_q</option>
+        </select>
+      </label>
+    </div>
+    <div class="row nums">
+      <label>shifts <input type="number" id="dm-shifts" min="0" max="10" step="1" value="0"></label>
+      <label>overlap <input type="number" id="dm-overlap" min="0" max="0.99" step="0.01" value="0.25"></label>
+      <label>segment <input type="number" id="dm-segment" min="1" step="1" placeholder="auto"></label>
+    </div>
+    <div class="row">
+      <button id="dm-run" class="run">Run</button>
+      <button id="dm-stop" class="stop" disabled>Stop</button>
+    </div>
+    <div class="progress"><div class="bar" id="dm-bar"></div></div>
+    <div class="msg" id="dm-msg"></div>
+  </div>
+
+  <div class="panel" id="panel-adtof">
+    <h2>2 &middot; adtof <span class="chip" id="ad-status">idle</span></h2>
+    <div id="sliders"></div>
+    <div class="row">
+      <label>fps <input type="number" id="ad-fps" min="25" max="200" step="25" value="100"></label>
+      <label title="re-pick cached activations on every slider move (instant, no net re-run)">
+        <input type="checkbox" id="ad-live"> live-update thresholds
+      </label>
+    </div>
+    <div class="row">
+      <button id="ad-run" class="run">Run</button>
+      <button id="ad-stop" class="stop" disabled>Stop</button>
+    </div>
+    <div class="progress"><div class="bar" id="ad-bar"></div></div>
+    <div class="msg" id="ad-msg"></div>
+  </div>
+
+  <div class="panel" id="panel-out">
+    <h2>downloads</h2>
+    <div class="row">
+      <label>grid
+        <select id="out-grid">
+          <option>1/8</option>
+          <option selected>1/16</option>
+          <option>1/16T</option>
+          <option>1/32</option>
+        </select>
+      </label>
+    </div>
+    <div class="dl-list">
+      <button class="dl" id="dl-stem" disabled>drum stem .wav</button>
+      <button class="dl" id="dl-midi" disabled>MIDI &middot; unquantized (Ardour)</button>
+      <button class="dl" id="dl-midi-quant" disabled>MIDI &middot; quantized</button>
+      <button class="dl" id="dl-musicxml" disabled>MusicXML (MuseScore)</button>
+    </div>
+    <div class="hint">MIDI is unquantized at true absolute times (t=0 preserved) with the
+      detected tempo embedded. MusicXML is a percussion staff built from the quantized
+      grid &mdash; rhythm is exact, drum-line styling may need touch-up in MuseScore.</div>
+  </div>
+
+</section>
+
+<section id="lanes">
+  <div class="lane">
+    <div class="side">
+      <span class="lane-name">input</span>
+      <input type="range" class="gain" id="gain-input" min="0" max="1.5" step="0.01" value="0.9" title="input gain">
+    </div>
+    <div class="body" id="wave-input"><div class="placeholder">no input loaded</div></div>
+  </div>
+  <div class="lane">
+    <div class="side">
+      <span class="lane-name">stem</span>
+      <input type="range" class="gain" id="gain-stem" min="0" max="1.5" step="0.01" value="0.9" title="stem gain">
+    </div>
+    <div class="body" id="wave-stem"><div class="placeholder">no drum stem yet</div></div>
+  </div>
+  <div class="lane">
+    <div class="side">
+      <span class="lane-name">midi</span>
+      <input type="range" class="gain" id="gain-midi" min="0" max="1.5" step="0.01" value="0.8" title="midi synth gain">
+    </div>
+    <div class="body" id="roll-wrap"><canvas id="roll"></canvas></div>
+  </div>
+</section>
+
+<footer><span id="log-line"></span></footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

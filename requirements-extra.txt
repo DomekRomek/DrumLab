@@ -1,0 +1,17 @@
+# drumlab — NEW dependencies only. All pure-CPU; none depend on torch.
+#
+# !!! WARNING — protect the torch/CUDA install !!!
+# torch must stay at 2.12.0+cu130 (plus torchaudio 2.11.0 / torchcodec 0.14.0).
+# A CPU wheel silently kills GPU support. Therefore:
+#   * install with:  python -m pip install -r requirements-extra.txt
+#     (use the venv python: C:\Users\dom\Documents\_Drumming\Stem-Music\venv\Scripts\python.exe)
+#   * NEVER pass -U / --upgrade / --force-reinstall in this venv
+#   * NEVER install anything that lists torch as a dependency without --no-deps
+#   * after installing, sanity-check:
+#       python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+#     expected: 2.12.0+cu130 True
+
+fastapi
+uvicorn
+python-multipart
+music21
