@@ -3,7 +3,7 @@ r"""DRUMLAB -- local drum-transcription control GUI
 
 Wraps the Demucs -> ADTOF pipeline in a hands-on local web UI:
 manual Run/Stop per stage, cached activations with instant threshold
-re-picking, three time-aligned lanes (input / stem / MIDI piano-roll),
+re-picking, four time-aligned lanes (input / drums / backing / MIDI roll),
 and Ardour-ready MIDI + quantized MIDI + MusicXML downloads.
 
 INSTALL (inside the existing venv -- do NOT let pip touch torch):
@@ -44,7 +44,7 @@ from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 APP_DIR = Path(__file__).resolve().parent
@@ -157,10 +157,19 @@ class Job:
 DEMUCS_JOB = Job("demucs")
 ADTOF_JOB = Job("adtof")
 
+
+def reset_jobs() -> None:
+    for job in (DEMUCS_JOB, ADTOF_JOB):
+        job.status = "idle"
+        job.progress = None
+        job.message = ""
+        job.log.clear()
+        job.cancelled = False
+
 STATE_LOCK = threading.Lock()
 STATE = {
     "input": None,  # {"id", "name", "stem_name", "wav", "duration"}
-    "stem": None,   # {"key", "wav"}
+    "stem": None,   # {"key", "wav", "nodrums"}
     "acts": None,   # {"key", "dir", "fps", "tempo", "duration"}
     "pick": None,   # {"rev", "thresholds", "fps", "events", "counts"}
 }
@@ -176,7 +185,7 @@ def sha1_file(path: Path) -> str:
     return h.hexdigest()[:16]
 
 
-def stream_subprocess(job: Job, cmd: list, on_line=None) -> int:
+def stream_subprocess(job: Job, cmd: list) -> int:
     """Run cmd, streaming combined output into job.log / job.progress.
 
     Returns the process return code. Honors job.cancelled via kill_tree.
@@ -217,8 +226,6 @@ def stream_subprocess(job: Job, cmd: list, on_line=None) -> int:
             else:
                 job.log.append(piece[:300])
                 job.message = piece[:160]
-                if on_line:
-                    on_line(piece)
     proc.wait()
     return proc.returncode
 
@@ -227,7 +234,7 @@ def classify_error(log_tail: str) -> str:
     low = log_tail.lower()
     if "out of memory" in low or "cuda oom" in low:
         return "CUDA out of memory -- switch to CPU, or lower the segment value."
-    if "longer segment" in low or "transformer model" in low and "segment" in low:
+    if "longer segment" in low or ("transformer model" in low and "segment" in low):
         return "Segment too long for this model (htdemucs caps at about 7 s) -- lower it or leave it empty."
     if "ffmpeg" in low or "could not load" in low or "decoding" in low or "soundfile" in low:
         return "Audio decode failed (FFmpeg) -- check the input file format."
@@ -305,7 +312,7 @@ def demucs_thread(params: dict) -> None:
         job.progress = 1.0
         job.finish("done", "Drum stem ready")
     except Exception as e:  # noqa: BLE001
-        job.finish("error", f"demucs stage crashed: {e}")
+        job.finish("error", f"Separation stage crashed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -329,10 +336,10 @@ def do_pick(thresholds: dict) -> dict:
     """Peak-pick the cached activation curves. Milliseconds; no net run."""
     acts_info = STATE["acts"]
     if not acts_info:
-        raise RuntimeError("no cached activations -- run ADTOF first")
+        raise RuntimeError("No cached activations -- run Transcription first")
     arr = load_acts(acts_info["key"])
     if arr is None:
-        raise RuntimeError("activation cache missing on disk -- re-run ADTOF")
+        raise RuntimeError("Activation cache missing on disk -- re-run Transcription")
     th = [float(thresholds.get(n, DEFAULT_THRESHOLDS[n])) for n in CH_NAMES]
     picker = PP.PeakPicker(thresholds=th, fps=int(acts_info["fps"]))
     picked = picker.pick(arr, labels=list(range(5)), label_offset=0)[0]
@@ -401,7 +408,7 @@ def adtof_thread(params: dict) -> None:
         job.progress = 1.0
         job.finish("done", f"{n} hits picked -- tempo about {meta['tempo']:.1f} BPM")
     except Exception as e:  # noqa: BLE001
-        job.finish("error", f"ADTOF stage crashed: {e}")
+        job.finish("error", f"Transcription stage crashed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +515,7 @@ def build_musicxml(events: dict, tempo: float, grid: str, path: Path) -> None:
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
-app = FastAPI(title="drumlab", docs_url=None, redoc_url=None)
+app = FastAPI(title="DrumLab", docs_url=None, redoc_url=None)
 
 
 @app.get("/")
@@ -563,11 +570,7 @@ def upload(file: UploadFile = File(...)):
         STATE["stem"] = None
         STATE["acts"] = None
         STATE["pick"] = None
-    for job in (DEMUCS_JOB, ADTOF_JOB):
-        job.status = "idle"
-        job.progress = None
-        job.message = ""
-        job.log.clear()
+    reset_jobs()
     return {"input": STATE["input"]}
 
 
@@ -685,12 +688,13 @@ STEM_FMTS = {
 
 
 def stem_download(which: str, fmt: str):
+    label = "drum stem" if which == "drums" else "backing track"
     stem = STATE["stem"]
     if not stem:
         raise HTTPException(409, "No separation output yet")
     src = stem["wav"] if which == "drums" else stem.get("nodrums")
     if not src:
-        raise HTTPException(409, f"No {which.replace(chr(95), chr(32))} stem available")
+        raise HTTPException(409, f"No {label} available")
     if fmt not in STEM_FMTS:
         raise HTTPException(400, f"Invalid audio format -- use one of {list(STEM_FMTS)}")
     args, ext, mime = STEM_FMTS[fmt]
@@ -726,12 +730,7 @@ def reset():
     for d in (UPLOADS, STEMS, ACTS, OUT, DEMUCS_TMP):
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True, exist_ok=True)
-    for job in (DEMUCS_JOB, ADTOF_JOB):
-        job.status = "idle"
-        job.progress = None
-        job.message = ""
-        job.log.clear()
-        job.cancelled = False
+    reset_jobs()
     return {"ok": True}
 
 
@@ -772,7 +771,7 @@ app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 # Launcher
 # ---------------------------------------------------------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="drumlab -- local drum transcription GUI")
+    ap = argparse.ArgumentParser(description="DrumLab -- local drum transcription GUI")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
@@ -780,7 +779,7 @@ def main() -> None:
     url = f"http://127.0.0.1:{args.port}"
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    print(f"drumlab running at {url}  (Ctrl+C to quit)")
+    print(f"DrumLab running at {url}  (Ctrl+C to quit)")
 
     import uvicorn
 

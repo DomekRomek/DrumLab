@@ -38,6 +38,7 @@ const ROLL_ORDER = ["kick", "snare", "hihat", "tom", "cymbal"]; // top -> bottom
 const CLASS_TRIM = { kick: 0.9, snare: 1.0, hihat: 0.22, tom: 0.9, cymbal: 0.22 };
 const LANE_NAMES = ["input", "stem", "nodrums"];
 const LANE_CONT = { input: "wave-input", stem: "wave-stem", nodrums: "wave-nodrums" };
+const LANE_LABEL = { input: "Input", stem: "Drum stem", nodrums: "Backing" };
 const LANE_PLACEHOLDER = {
   input: "No input loaded",
   stem: "Run separation to hear the drum stem",
@@ -422,8 +423,7 @@ async function loadLane(name, url) {
   engine.lanes[name] = { ws, player, height: 0 };
 
   recomputeDuration();
-  setLog(LANE_PLACEHOLDER[name].startsWith("No") ? "Input audio loaded (" + player.buffer.duration.toFixed(1) + " s)"
-    : "Audio loaded (" + player.buffer.duration.toFixed(1) + " s)");
+  setLog(LANE_LABEL[name] + " audio loaded (" + player.buffer.duration.toFixed(1) + " s)");
 }
 
 function recomputeDuration() {
@@ -987,6 +987,7 @@ async function doUpload(file) {
     fd.append("file", file);
     const r = await api("/api/upload", { method: "POST", body: fd });
     setLog("Loaded " + r.input.name);
+    poll(true);
   } catch (e) {
     $("file-name").innerHTML = "&nbsp;";
     setLog("Upload failed: " + e.message, true);
@@ -1104,9 +1105,10 @@ const knobs = {
     onGain: (g) => { mix.midi.gain = g; applyMix(); },
   }),
 };
+const KNOB_LABEL = { kick: "Kick", snare: "Snare", hihat: "Hat", tom: "Tom", cymbal: "Cymbal" };
 for (const c of CLASSES) {
   knobs[c.id] = makeDbKnob("knob-" + c.id, {
-    label: c.label.slice(0, 3), size: 24, maxDb: 6,
+    label: KNOB_LABEL[c.id], size: 24, maxDb: 6,
     color: COLORS[c.id],
     onGain: (g) => { classGains[c.id].gain.value = CLASS_TRIM[c.id] * g; },
   });
