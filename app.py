@@ -172,6 +172,7 @@ STATE = {
     "stem": None,   # {"key", "wav", "nodrums"}
     "acts": None,   # {"key", "dir", "fps", "tempo", "duration"}
     "pick": None,   # {"rev", "thresholds", "fps", "events", "counts"}
+    "tempo_override": None,  # manual BPM; None = use the detected tempo
 }
 PICK_REV = [0]
 ACTS_RAM: "OrderedDict[str, np.ndarray]" = OrderedDict()  # small LRU of activation arrays
@@ -414,6 +415,10 @@ def adtof_thread(params: dict) -> None:
 # ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
+def effective_tempo(acts: dict) -> float:
+    return float(STATE["tempo_override"] or acts["tempo"])
+
+
 def require_pick() -> tuple:
     pick, acts = STATE["pick"], STATE["acts"]
     if not pick or not acts:
@@ -570,6 +575,7 @@ def upload(file: UploadFile = File(...)):
         STATE["stem"] = None
         STATE["acts"] = None
         STATE["pick"] = None
+        STATE["tempo_override"] = None
     reset_jobs()
     return {"input": STATE["input"]}
 
@@ -602,6 +608,22 @@ def adtof_stop():
     return {"ok": True}
 
 
+@app.post("/api/tempo")
+def set_tempo(params: dict):
+    """Set or clear the manual BPM override used by exports and the score."""
+    bpm = params.get("bpm")
+    if bpm is not None:
+        try:
+            bpm = float(bpm)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Invalid BPM value")
+        if not 20 <= bpm <= 400:
+            raise HTTPException(400, "BPM must be between 20 and 400")
+    with STATE_LOCK:
+        STATE["tempo_override"] = bpm
+    return {"tempo_override": STATE["tempo_override"]}
+
+
 @app.post("/api/adtof/pick")
 def adtof_pick(params: dict):
     """Instant threshold re-pick on cached activations (no net run)."""
@@ -624,6 +646,7 @@ def get_state():
         "acts": STATE["acts"],
         "pick": {"rev": pick["rev"], "thresholds": pick["thresholds"],
                  "fps": pick["fps"], "counts": pick["counts"]} if pick else None,
+        "tempo_override": STATE["tempo_override"],
         "jobs": {"demucs": DEMUCS_JOB.as_dict(), "adtof": ADTOF_JOB.as_dict()},
         "defaults": {"thresholds": DEFAULT_THRESHOLDS},
     }
@@ -633,7 +656,8 @@ def get_state():
 def get_events():
     pick, acts = require_pick()
     return {"rev": pick["rev"], "events": pick["events"],
-            "tempo": acts["tempo"], "duration": acts["duration"]}
+            "tempo": effective_tempo(acts), "detected_tempo": acts["tempo"],
+            "duration": acts["duration"]}
 
 
 @app.get("/api/audio/{which}")
@@ -726,6 +750,7 @@ def reset():
         STATE["stem"] = None
         STATE["acts"] = None
         STATE["pick"] = None
+        STATE["tempo_override"] = None
     ACTS_RAM.clear()
     for d in (UPLOADS, STEMS, ACTS, OUT, DEMUCS_TMP):
         shutil.rmtree(d, ignore_errors=True)
@@ -743,7 +768,7 @@ def download(kind: str, grid: str = "1/16", fmt: str = "wav"):
     if kind == "nodrums":
         return stem_download("no_drums", fmt)
     pick, acts = require_pick()
-    tempo = float(acts["tempo"])
+    tempo = effective_tempo(acts)
     if kind == "midi":
         path = OUT / out_name("_adtof_raw.mid")
         build_midi(pick["events"], tempo, path)

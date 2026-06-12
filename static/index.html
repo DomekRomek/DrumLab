@@ -15,7 +15,7 @@
   <h1>DrumLab</h1>
   <div id="transport">
     <button id="btn-play" class="t-play" title="Play / pause (space)">&#9654;</button>
-    <button id="btn-stop" class="t-stop" title="Stop and return to start">&#9632;</button>
+    <button id="btn-stop" class="t-stop" title="Stop and return to start"><svg width="13" height="13" viewBox="0 0 13 13"><rect width="13" height="13" rx="2" fill="currentColor"/></svg></button>
     <span id="time-display" title="Transport position">0:00.000</span>
   </div>
   <div id="meta-bar">
@@ -86,16 +86,16 @@
 
   <div class="panel" id="panel-adtof">
     <h2>2 &middot; Transcription &mdash; ADTOF <span class="chip" id="ad-status">Idle</span></h2>
-    <div id="sliders"></div>
-    <div class="row">
-      <label title="Model frame rate (frames per second). Changes the preprocessing hop, so a new value re-runs the network. 100 is the rate the model was trained at.">FPS <input type="number" id="ad-fps" min="25" max="200" step="25" value="100"></label>
-      <label class="switch" title="Re-detect hits from the cached activation curves on every slider move. Instant — the network is not re-run.">
-        <input type="checkbox" id="ad-live"><span class="track"></span> Auto-apply thresholds
-      </label>
-    </div>
-    <div class="row">
-      <button id="ad-run" class="run">Run</button>
-      <button id="ad-stop" class="stop" disabled>Stop</button>
+    <div class="adtof-cols">
+      <div id="sliders"></div>
+      <div class="adtof-side">
+        <label title="Model frame rate (frames per second). Changes the preprocessing hop, so a new value re-runs the network. 100 is the rate the model was trained at.">FPS <input type="number" id="ad-fps" min="25" max="200" step="25" value="100"></label>
+        <label class="switch" title="Re-detect hits from the cached activation curves on every slider move. Instant — the network is not re-run.">
+          <input type="checkbox" id="ad-live"><span class="track"></span> Auto-apply
+        </label>
+        <button id="ad-run" class="run">Run</button>
+        <button id="ad-stop" class="stop" disabled>Stop</button>
+      </div>
     </div>
     <div class="progress"><div class="bar" id="ad-bar"></div></div>
     <div class="msg" id="ad-msg"></div>
@@ -119,6 +119,9 @@
           <option value="ogg192">OGG 192k</option>
           <option value="ogg320">OGG 320k</option>
         </select>
+      </label>
+      <label title="Manual tempo for the exports and score. Leave empty to use the detected tempo.">BPM
+        <input type="number" id="out-bpm" min="20" max="400" step="0.1" placeholder="auto">
       </label>
     </div>
     <div class="dl-list">

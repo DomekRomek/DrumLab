@@ -33,6 +33,7 @@ const CLASSES = [
 ];
 const COLORS = { kick: "#e74c3c", snare: "#f0a432", hihat: "#2ecc71", tom: "#3a9ad9", cymbal: "#a06fd6" };
 const ROLL_ORDER = ["kick", "snare", "hihat", "tom", "cymbal"]; // top -> bottom rows
+const ROLL_LABEL = { kick: "Kick", snare: "Snare", hihat: "Hi-hat", tom: "Tom", cymbal: "Cymbal" };
 // hidden per-instrument trim: evens out raw synth loudness so the user-facing
 // knobs all sit at 0 dB (snare carries the groove; metals are tamed hard)
 const CLASS_TRIM = { kick: 0.9, snare: 1.0, hihat: 0.22, tom: 0.9, cymbal: 0.22 };
@@ -207,10 +208,15 @@ function drawStereoMeter(canvas, dbs, withScale) {
   ctx.fillStyle = "#8b919e";
   ctx.strokeStyle = "rgba(139,145,158,0.4)";
   ctx.font = "8px Consolas, monospace";
+  const labeled = [-48, -24, -12, 0]; // -6/-3 get ticks only, labels would collide near 0
   for (const m of marks) {
     const x = dbToFrac(m) * W;
     ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H - padB); ctx.stroke();
-    if (withScale) ctx.fillText(m === 0 ? "0" : String(m), Math.min(x + 1, W - 16), H - 2);
+    if (withScale && labeled.includes(m)) {
+      const text = String(m);
+      const tx = m === 0 ? W - ctx.measureText(text).width - 1 : x + 1;
+      ctx.fillText(text, tx, H - 2);
+    }
   }
 }
 
@@ -251,18 +257,19 @@ const master = new Tone.Gain(1.0);
 master.connect(Tone.getDestination());
 const laneGains = {
   input: new Tone.Gain(1.0).connect(master),
-  stem: new Tone.Gain(0).connect(master),     // drums/backing start at -inf
+  stem: new Tone.Gain(0).connect(master),     // applyMix() sets these (drums/backing start muted)
   nodrums: new Tone.Gain(0).connect(master),
 };
 const midiBus = new Tone.Gain(1.0).connect(master);
 const classGains = {};
 for (const c of CLASSES) classGains[c.id] = new Tone.Gain(CLASS_TRIM[c.id]).connect(midiBus);
 
-// track mixer state; node gain = knob gain, gated by mute/solo
+// track mixer state; node gain = knob gain, gated by mute/solo.
+// drums/backing sit at 0 dB but start muted — unmute to hear them.
 const mix = {
   input: { gain: 1, mute: false, solo: false, node: laneGains.input },
-  stem: { gain: 0, mute: false, solo: false, node: laneGains.stem },
-  nodrums: { gain: 0, mute: false, solo: false, node: laneGains.nodrums },
+  stem: { gain: 1, mute: true, solo: false, node: laneGains.stem },
+  nodrums: { gain: 1, mute: true, solo: false, node: laneGains.nodrums },
   midi: { gain: 1, mute: false, solo: false, node: midiBus },
 };
 
@@ -289,6 +296,7 @@ function bindMuteSolo(track) {
   });
 }
 for (const t of ["input", "stem", "nodrums", "midi"]) bindMuteSolo(t);
+for (const t of ["stem", "nodrums"]) $("mute-" + t).classList.add("active");
 
 const taps = {
   master: makeTap(master),
@@ -718,7 +726,7 @@ function drawRoll() {
   for (let i = 0; i < rows; i++) {
     const cls = ROLL_ORDER[i];
     ctx.fillStyle = COLORS[cls];
-    ctx.fillText(cls, 4, i * rowH + 11);
+    ctx.fillText(ROLL_LABEL[cls], 4, i * rowH + 11);
   }
 
   const t = Tone.Transport.seconds;
@@ -864,8 +872,11 @@ async function fetchEvents() {
   const d = await api("/api/events");
   roll.events = d.events;
   engine.tempo = d.tempo;
-  $("tempo-display").textContent = d.tempo.toFixed(1) + " BPM";
-  $("out-tempo").textContent = "Detected tempo: " + d.tempo.toFixed(1) + " BPM (set your DAW session tempo to this)";
+  const manual = Math.abs(d.tempo - d.detected_tempo) > 0.001;
+  $("tempo-display").textContent = d.tempo.toFixed(1) + " BPM" + (manual ? " (manual)" : "");
+  $("out-tempo").textContent = manual
+    ? "Manual tempo: " + d.tempo.toFixed(1) + " BPM · detected " + d.detected_tempo.toFixed(1) + " BPM"
+    : "Detected tempo: " + d.tempo.toFixed(1) + " BPM (set your DAW session tempo to this)";
   rebuildPart(d.events);
   recomputeDuration();
   updateCounts();
@@ -1073,6 +1084,19 @@ $("dl-view-score").addEventListener("click", () => {
   window.open("/static/score.html?grid=" + encodeURIComponent($("out-grid").value), "_blank");
 });
 
+$("out-bpm").addEventListener("change", async () => {
+  const v = $("out-bpm").value;
+  try {
+    await postJSON("/api/tempo", { bpm: v ? parseFloat(v) : null });
+    if (lastPickRev) await fetchEvents();
+  } catch (e) { setLog("Tempo: " + e.message, true); }
+});
+
+// enabling auto-apply re-detects immediately — sliders may have moved while it was off
+$("ad-live").addEventListener("change", () => {
+  if ($("ad-live").checked && lastState && lastState.acts) debouncedPick();
+});
+
 $("btn-reset").addEventListener("click", async () => {
   try {
     await postJSON("/api/reset", {});
@@ -1093,11 +1117,11 @@ const knobs = {
     onGain: (g) => { mix.input.gain = g; applyMix(); },
   }),
   stem: makeDbKnob("knob-stem", {
-    label: "Gain", size: 40, maxDb: 6, startDb: -Infinity,
+    label: "Gain", size: 40, maxDb: 6,
     onGain: (g) => { mix.stem.gain = g; applyMix(); },
   }),
   nodrums: makeDbKnob("knob-nodrums", {
-    label: "Gain", size: 40, maxDb: 6, startDb: -Infinity,
+    label: "Gain", size: 40, maxDb: 6,
     onGain: (g) => { mix.nodrums.gain = g; applyMix(); },
   }),
   midi: makeDbKnob("knob-midi", {
@@ -1174,6 +1198,7 @@ async function poll(fast) {
       updateCounts();
       $("tempo-display").textContent = "";
       $("out-tempo").textContent = "";
+      $("out-bpm").value = "";
       seekAll(0);
       loadLane("input", "/api/audio/input?v=" + s.input.id).catch((e) => setLog("Waveform failed: " + e.message, true));
     }
@@ -1187,6 +1212,13 @@ async function poll(fast) {
     if (s.pick && s.pick.rev !== lastPickRev) {
       lastPickRev = s.pick.rev;
       fetchEvents().catch((e) => setLog("Event fetch failed: " + e.message, true));
+    }
+
+    // reflect a server-side BPM override (e.g. after a page reload)
+    const bpmEl = $("out-bpm");
+    if (document.activeElement !== bpmEl) {
+      const want = s.tempo_override != null ? String(s.tempo_override) : "";
+      if (bpmEl.value !== want) bpmEl.value = want;
     }
 
     // chained run: separation finished -> start transcription
