@@ -1,5 +1,5 @@
 "use strict";
-/* drumlab frontend V0.2 — vanilla JS, WaveSurfer 7.8.6 (waveforms) + Tone.js 14.8.49 (clock/synth) */
+/* DrumLab frontend — vanilla JS, WaveSurfer 7.8.6 (waveforms) + Tone.js 14.8.49 (clock/synth) */
 
 const $ = (id) => document.getElementById(id);
 
@@ -33,22 +33,28 @@ const CLASSES = [
 ];
 const COLORS = { kick: "#e74c3c", snare: "#f0a432", hihat: "#2ecc71", tom: "#3a9ad9", cymbal: "#a06fd6" };
 const ROLL_ORDER = ["kick", "snare", "hihat", "tom", "cymbal"]; // top -> bottom rows
-// default per-instrument synth gains (hi-hat/cymbal tamed — raw synths are piercing)
-const CLASS_GAIN_DEF = { kick: 1.0, snare: 0.85, hihat: 0.3, tom: 0.9, cymbal: 0.45 };
+// hidden per-instrument trim: evens out raw synth loudness so the user-facing
+// knobs all sit at 0 dB (snare carries the groove; metals are tamed hard)
+const CLASS_TRIM = { kick: 0.9, snare: 1.0, hihat: 0.22, tom: 0.9, cymbal: 0.22 };
 const LANE_NAMES = ["input", "stem", "nodrums"];
 const LANE_CONT = { input: "wave-input", stem: "wave-stem", nodrums: "wave-nodrums" };
-const LANE_PLACEHOLDER = { input: "no input loaded", stem: "no drum stem yet", nodrums: "no demucs backing yet" };
+const LANE_PLACEHOLDER = {
+  input: "No input loaded",
+  stem: "Run separation to hear the drum stem",
+  nodrums: "Run separation to hear the backing",
+};
 const LANE_COLORS = {
   input:   { wave: "#4a6f96", prog: "#76a8d8" },
   stem:    { wave: "#4f8f6a", prog: "#7cc79b" },
   nodrums: { wave: "#8a7a4d", prog: "#c4ad6e" },
 };
+const STATUS_LABEL = { idle: "Idle", running: "Running…", done: "Complete", cancelled: "Stopped", error: "Error" };
 
 /* ------------------------------------------------------------------ */
-/* knob component (rotary, drag-vertical / wheel / dblclick-reset)     */
+/* knob component (rotary; drag vertically, wheel, double-click reset) */
 /* ------------------------------------------------------------------ */
 function createKnob(hostId, opts) {
-  const o = Object.assign({ min: 0, max: 1.5, value: 1.0, size: 38, color: "#4ea1ff", label: "", fmt: (v) => v.toFixed(2) }, opts);
+  const o = Object.assign({ min: 0, max: 1, value: 1, size: 38, color: "#4ea1ff", label: "", fmt: (v) => v.toFixed(2) }, opts);
   const host = $(hostId);
   const wrap = document.createElement("div");
   wrap.className = "knob";
@@ -60,15 +66,20 @@ function createKnob(hostId, opts) {
   canvas.style.height = o.size + "px";
   const label = document.createElement("span");
   label.className = "knob-label";
-  label.textContent = o.label;
   wrap.appendChild(canvas);
-  if (o.label) wrap.appendChild(label);
+  wrap.appendChild(label);
   host.appendChild(wrap);
 
   const ctx = canvas.getContext("2d");
-  const defVal = o.value;
+  const defVal = (o.resetValue !== undefined) ? o.resetValue : o.value;
   let value = o.value;
+  let dragY = null, dragV = null, hover = false;
   const A0 = 0.75 * Math.PI, A1 = 2.25 * Math.PI; // 270° sweep
+
+  function refreshLabel() {
+    // live readout while interacting, name otherwise
+    label.textContent = (hover || dragY !== null) ? o.fmt(value) : (o.label || o.fmt(value));
+  }
 
   function draw() {
     const s = o.size, c = s / 2, r = s / 2 - 3;
@@ -94,14 +105,15 @@ function createKnob(hostId, opts) {
   function setValue(v, fire) {
     value = Math.min(o.max, Math.max(o.min, v));
     draw();
+    refreshLabel();
     if (fire !== false && o.onChange) o.onChange(value);
   }
 
-  let dragY = null, dragV = null;
   canvas.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     canvas.setPointerCapture(e.pointerId);
     dragY = e.clientY; dragV = value;
+    refreshLabel();
   });
   canvas.addEventListener("pointermove", (e) => {
     if (dragY === null) return;
@@ -109,8 +121,10 @@ function createKnob(hostId, opts) {
     const fine = e.shiftKey ? 0.25 : 1;
     setValue(dragV + (dragY - e.clientY) * (range / 150) * fine);
   });
-  canvas.addEventListener("pointerup", () => { dragY = null; });
-  canvas.addEventListener("pointercancel", () => { dragY = null; });
+  canvas.addEventListener("pointerup", () => { dragY = null; refreshLabel(); });
+  canvas.addEventListener("pointercancel", () => { dragY = null; refreshLabel(); });
+  canvas.addEventListener("pointerenter", () => { hover = true; refreshLabel(); });
+  canvas.addEventListener("pointerleave", () => { hover = false; refreshLabel(); });
   canvas.addEventListener("dblclick", () => setValue(defVal));
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
@@ -119,6 +133,35 @@ function createKnob(hostId, opts) {
 
   setValue(value, false);
   return { get: () => value, set: setValue };
+}
+
+/* logarithmic (dB) gain knob: position 0 = -inf, then -60 dB .. maxDb */
+const KNOB_MIN_DB = -60;
+
+function makeDbKnob(hostId, o) {
+  const maxDb = o.maxDb !== undefined ? o.maxDb : 6;
+  const posToDb = (p) => (p <= 0.004 ? -Infinity : KNOB_MIN_DB + p * (maxDb - KNOB_MIN_DB));
+  const dbToPos = (db) => (!isFinite(db) ? 0 : Math.min(1, Math.max(0, (db - KNOB_MIN_DB) / (maxDb - KNOB_MIN_DB))));
+  const fmt = (p) => {
+    const db = posToDb(p);
+    if (!isFinite(db)) return "-inf dB";
+    return (db >= 0 ? "+" : "-") + Math.abs(db).toFixed(1) + " dB";
+  };
+  const apply = (p) => {
+    const db = posToDb(p);
+    o.onGain(isFinite(db) ? Math.pow(10, db / 20) : 0);
+  };
+  const startDb = o.startDb !== undefined ? o.startDb : 0;
+  const knob = createKnob(hostId, {
+    label: o.label, size: o.size, color: o.color,
+    min: 0, max: 1,
+    value: dbToPos(startDb),
+    resetValue: dbToPos(0),
+    fmt: fmt,
+    onChange: apply,
+  });
+  apply(knob.get());
+  return knob;
 }
 
 /* ------------------------------------------------------------------ */
@@ -149,7 +192,6 @@ function drawStereoMeter(canvas, dbs, withScale) {
     ctx.fillRect(0, y, W, barH);
     const f = dbToFrac(db);
     const gx = (v) => dbToFrac(v) * W;
-    // green / yellow / red segments up to the level
     const segs = [[-60, -12, "#2f9e57"], [-12, -3, "#d9a62e"], [-3, 0, "#c0463f"]];
     for (const [a, b, col] of segs) {
       const x0 = gx(a), x1 = Math.min(gx(b), f * W);
@@ -161,7 +203,6 @@ function drawStereoMeter(canvas, dbs, withScale) {
       ctx.fillRect(pf * W - 1, y, 1.5, barH);
     }
   }
-  // scale ticks
   ctx.fillStyle = "#8b919e";
   ctx.strokeStyle = "rgba(139,145,158,0.4)";
   ctx.font = "8px Consolas, monospace";
@@ -193,11 +234,11 @@ function makeTap(node) {
 }
 
 /* ------------------------------------------------------------------ */
-/* audio graph                                                         */
+/* audio graph + mixer (mute / solo)                                   */
 /* ------------------------------------------------------------------ */
 const engine = {
   started: false,
-  lanes: { input: null, stem: null, nodrums: null },  // {ws, player}
+  lanes: { input: null, stem: null, nodrums: null },  // {ws, player, height}
   part: null,
   synths: null,
   duration: 0,
@@ -208,46 +249,94 @@ const engine = {
 const master = new Tone.Gain(1.0);
 master.connect(Tone.getDestination());
 const laneGains = {
-  input: new Tone.Gain(0.9).connect(master),
-  stem: new Tone.Gain(0.9).connect(master),
-  nodrums: new Tone.Gain(0.9).connect(master),
+  input: new Tone.Gain(1.0).connect(master),
+  stem: new Tone.Gain(0).connect(master),     // drums/backing start at -inf
+  nodrums: new Tone.Gain(0).connect(master),
 };
-const midiBus = new Tone.Gain(0.8).connect(master);
+const midiBus = new Tone.Gain(1.0).connect(master);
 const classGains = {};
-for (const c of CLASSES) classGains[c.id] = new Tone.Gain(CLASS_GAIN_DEF[c.id]).connect(midiBus);
+for (const c of CLASSES) classGains[c.id] = new Tone.Gain(CLASS_TRIM[c.id]).connect(midiBus);
+
+// track mixer state; node gain = knob gain, gated by mute/solo
+const mix = {
+  input: { gain: 1, mute: false, solo: false, node: laneGains.input },
+  stem: { gain: 0, mute: false, solo: false, node: laneGains.stem },
+  nodrums: { gain: 0, mute: false, solo: false, node: laneGains.nodrums },
+  midi: { gain: 1, mute: false, solo: false, node: midiBus },
+};
+
+function applyMix() {
+  const anySolo = Object.values(mix).some((m) => m.solo);
+  for (const k in mix) {
+    const m = mix[k];
+    const audible = !m.mute && (!anySolo || m.solo);
+    m.node.gain.value = audible ? m.gain : 0;
+  }
+}
+
+function bindMuteSolo(track) {
+  const mBtn = $("mute-" + track), sBtn = $("solo-" + track);
+  mBtn.addEventListener("click", () => {
+    mix[track].mute = !mix[track].mute;
+    mBtn.classList.toggle("active", mix[track].mute);
+    applyMix();
+  });
+  sBtn.addEventListener("click", () => {
+    mix[track].solo = !mix[track].solo;
+    sBtn.classList.toggle("active", mix[track].solo);
+    applyMix();
+  });
+}
+for (const t of ["input", "stem", "nodrums", "midi"]) bindMuteSolo(t);
 
 const taps = {
   master: makeTap(master),
   input: makeTap(laneGains.input),
   stem: makeTap(laneGains.stem),
   nodrums: makeTap(laneGains.nodrums),
+  midi: makeTap(midiBus),
 };
 
+/* ------------------------------------------------------------------ */
+/* drum synths                                                         */
+/* ------------------------------------------------------------------ */
 function makeSynths() {
   const kick = new Tone.MembraneSynth({
     pitchDecay: 0.04, octaves: 6,
     envelope: { attack: 0.001, decay: 0.35, sustain: 0 },
   }).connect(classGains.kick);
 
-  const snareBP = new Tone.Filter(1800, "bandpass").connect(classGains.snare);
-  const snare = new Tone.NoiseSynth({
+  // snare = bright noise crack + short tonal body
+  const snareBP = new Tone.Filter(1700, "bandpass").connect(classGains.snare);
+  const snareNoise = new Tone.NoiseSynth({
     noise: { type: "white" },
-    envelope: { attack: 0.001, decay: 0.13, sustain: 0 },
+    envelope: { attack: 0.001, decay: 0.16, sustain: 0 },
   }).connect(snareBP);
+  const snareBody = new Tone.MembraneSynth({
+    pitchDecay: 0.02, octaves: 2,
+    envelope: { attack: 0.001, decay: 0.11, sustain: 0 },
+  }).connect(classGains.snare);
 
   const hihat = new Tone.MetalSynth({
     envelope: { attack: 0.001, decay: 0.06, release: 0.02 },
     harmonicity: 5.1, modulationIndex: 32, resonance: 6000, octaves: 1.2,
   }).connect(classGains.hihat);
 
+  // tom = slow shallow pitch sweep + stick-attack noise (a fast deep sweep reads as a laser bloop)
   const tom = new Tone.MembraneSynth({
-    pitchDecay: 0.06, octaves: 3,
-    envelope: { attack: 0.001, decay: 0.25, sustain: 0 },
+    pitchDecay: 0.08, octaves: 1.5,
+    envelope: { attack: 0.002, decay: 0.4, sustain: 0 },
   }).connect(classGains.tom);
+  const tomAttackHP = new Tone.Filter(2500, "highpass").connect(classGains.tom);
+  const tomAttack = new Tone.NoiseSynth({
+    noise: { type: "white" },
+    envelope: { attack: 0.001, decay: 0.02, sustain: 0 },
+  }).connect(tomAttackHP);
 
+  // gentle ride: low modulation + low resonance gives a soft ping, not a crash wash
   const cymbal = new Tone.MetalSynth({
-    envelope: { attack: 0.001, decay: 1.1, release: 0.4 },
-    harmonicity: 4.1, modulationIndex: 40, resonance: 5000, octaves: 1.5,
+    envelope: { attack: 0.002, decay: 1.6, release: 0.8 },
+    harmonicity: 3.1, modulationIndex: 14, resonance: 3500, octaves: 0.8,
   }).connect(classGains.cymbal);
 
   function metalHit(synth, freq, dur, time, vel) {
@@ -259,16 +348,22 @@ function makeSynths() {
     trigger(cls, time) {
       try {
         if (cls === "kick") kick.triggerAttackRelease("C1", 0.25, time);
-        else if (cls === "snare") snare.triggerAttackRelease(0.12, time, 0.9);
-        else if (cls === "tom") tom.triggerAttackRelease("A2", 0.2, time);
-        else if (cls === "hihat") metalHit(hihat, 320, 0.05, time, 0.5);
-        else if (cls === "cymbal") metalHit(cymbal, 240, 1.2, time, 0.45);
+        else if (cls === "snare") {
+          snareNoise.triggerAttackRelease(0.16, time, 1.0);
+          snareBody.triggerAttackRelease("G3", 0.1, time, 0.5);
+        } else if (cls === "tom") {
+          tom.triggerAttackRelease("G2", 0.4, time, 0.9);
+          tomAttack.triggerAttackRelease(0.02, time, 0.4);
+        } else if (cls === "hihat") metalHit(hihat, 320, 0.05, time, 0.5);
+        else if (cls === "cymbal") metalHit(cymbal, 330, 1.4, time, 0.35);
       } catch (e) { /* never break the transport */ }
     },
   };
 }
 
-/* lanes ---------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* lanes                                                               */
+/* ------------------------------------------------------------------ */
 function disposeLane(name) {
   const lane = engine.lanes[name];
   if (!lane) return;
@@ -276,6 +371,21 @@ function disposeLane(name) {
   try { lane.player.unsync(); lane.player.dispose(); } catch (e) {}
   engine.lanes[name] = null;
   $(LANE_CONT[name]).innerHTML = '<div class="placeholder">' + LANE_PLACEHOLDER[name] + "</div>";
+}
+
+function bufferPeak(toneBuffer) {
+  try {
+    const buf = toneBuffer.get();
+    let max = 0;
+    for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+      const data = buf.getChannelData(ch);
+      for (let i = 0; i < data.length; i += 16) {
+        const v = Math.abs(data[i]);
+        if (v > max) max = v;
+      }
+    }
+    return max;
+  } catch (e) { return 1; }
 }
 
 async function loadLane(name, url) {
@@ -288,6 +398,9 @@ async function loadLane(name, url) {
   player.connect(laneGains[name]);
   player.sync().start(0);
 
+  // scale the waveform against the whole track's peak (not the visible window)
+  const peak = Math.max(bufferPeak(player.buffer), 0.01);
+
   const ws = WaveSurfer.create({
     container: cont,
     url: url,
@@ -296,7 +409,8 @@ async function loadLane(name, url) {
     progressColor: LANE_COLORS[name].prog,
     cursorColor: "#e8e8e8",
     cursorWidth: 1,
-    normalize: true,
+    normalize: false,
+    barHeight: Math.min(1 / peak, 20) * 0.95,
     interact: true,
     autoScroll: true,
     autoCenter: false,
@@ -305,10 +419,11 @@ async function loadLane(name, url) {
   });
   ws.on("interaction", (t) => seekAll(t));
   ws.on("scroll", () => mirrorScroll(name));
-  engine.lanes[name] = { ws, player };
+  engine.lanes[name] = { ws, player, height: 0 };
 
   recomputeDuration();
-  setLog(name + " audio loaded (" + player.buffer.duration.toFixed(1) + "s)");
+  setLog(LANE_PLACEHOLDER[name].startsWith("No") ? "Input audio loaded (" + player.buffer.duration.toFixed(1) + " s)"
+    : "Audio loaded (" + player.buffer.duration.toFixed(1) + " s)");
 }
 
 function recomputeDuration() {
@@ -327,7 +442,9 @@ function recomputeDuration() {
   applyZoom();
 }
 
-/* transport ------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* transport                                                           */
+/* ------------------------------------------------------------------ */
 async function ensureAudio() {
   if (!engine.started) {
     await Tone.start();
@@ -382,7 +499,9 @@ function fmtTime(t) {
   return m + ":" + s.toFixed(3).padStart(6, "0");
 }
 
-/* loop ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* loop                                                                */
+/* ------------------------------------------------------------------ */
 const loop = { active: false, start: 0, end: 0, preview: null };
 
 function setLoop(a, b) {
@@ -398,7 +517,8 @@ function setLoop(a, b) {
     Tone.Transport.loop = true;
   } catch (e) {}
   $("loop-chip").classList.remove("hidden");
-  $("loop-range").textContent = a.toFixed(2) + "–" + b.toFixed(2) + "s";
+  $("loop-range").textContent = a.toFixed(2) + "–" + b.toFixed(2) + " s";
+  $("loop-deselect").disabled = false;
 }
 
 function clearLoop() {
@@ -406,9 +526,11 @@ function clearLoop() {
   loop.preview = null;
   try { Tone.Transport.loop = false; } catch (e) {}
   $("loop-chip").classList.add("hidden");
+  $("loop-deselect").disabled = true;
 }
 
 $("loop-clear").addEventListener("click", clearLoop);
+$("loop-deselect").addEventListener("click", clearLoop);
 
 function ensureOverlay(bodyEl) {
   let ov = bodyEl.querySelector(":scope > .loop-overlay");
@@ -434,7 +556,9 @@ function updateLoopOverlays() {
   }
 }
 
-/* scroll + zoom sync ----------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* scroll + zoom sync                                                  */
+/* ------------------------------------------------------------------ */
 let syncingScroll = false;
 
 function mirrorScroll(fromName) {
@@ -477,23 +601,48 @@ function fitPx() {
   return w / Math.max(0.001, engine.duration || 30);
 }
 
+let wsZoomTimer = null;
+
 function applyZoom() {
   const v = parseFloat($("zoom").value) / 100; // 0 = whole file fits, 1 = max
   const fit = fitPx();
   const maxPx = Math.max(fit * 1.001, 800);
   engine.pxPerSec = fit * Math.pow(maxPx / fit, v);
+  roll.scrollPx = Math.min(roll.scrollPx, maxScroll());
+  drawRoll();
+  // waveform re-render is the expensive part — debounce it so the slider stays fluid
+  clearTimeout(wsZoomTimer);
+  wsZoomTimer = setTimeout(applyWsZoom, 90);
+}
+
+function applyWsZoom() {
   for (const k of LANE_NAMES) {
     const lane = engine.lanes[k];
     if (lane) { try { lane.ws.zoom(engine.pxPerSec); } catch (e) {} }
   }
-  roll.scrollPx = Math.min(roll.scrollPx, maxScroll());
-  drawRoll();
 }
 
 $("zoom").addEventListener("input", applyZoom);
 $("zoom-in").addEventListener("click", () => { $("zoom").value = Math.min(100, parseFloat($("zoom").value) + 8); applyZoom(); });
 $("zoom-out").addEventListener("click", () => { $("zoom").value = Math.max(0, parseFloat($("zoom").value) - 8); applyZoom(); });
 window.addEventListener("resize", applyZoom);
+
+/* keep waveform heights in step with lane size (lanes grow when others hide) */
+function syncLaneHeights() {
+  for (const k of LANE_NAMES) {
+    const lane = engine.lanes[k];
+    if (!lane) continue;
+    const h = Math.max(56, $(LANE_CONT[k]).clientHeight - 4);
+    if (lane.height !== h) {
+      lane.height = h;
+      try { lane.ws.setOptions({ height: h }); } catch (e) {}
+    }
+  }
+  drawRoll();
+}
+
+const laneRO = new ResizeObserver(() => requestAnimationFrame(syncLaneHeights));
+for (const id of ["wave-input", "wave-stem", "wave-nodrums", "roll-wrap"]) laneRO.observe($(id));
 
 /* wheel scrubs all lanes left/right */
 for (const id of ["wave-input", "wave-stem", "wave-nodrums", "roll-wrap"]) {
@@ -619,36 +768,61 @@ $("roll-wrap").addEventListener("pointerup", (e) => {
     setLoop(tA, tB);
     return;
   }
-  if ($("midi-edit").checked) toggleNote(e.offsetX, e.offsetY);
+  if (editMode) toggleNote(e.offsetX, e.offsetY);
   else seekAll((roll.scrollPx + e.offsetX) / engine.pxPerSec);
 });
 
 $("roll-wrap").addEventListener("pointercancel", () => { rollDrag = null; loop.preview = null; });
 
-/* edit mode -------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* edit mode                                                           */
+/* ------------------------------------------------------------------ */
+let editMode = false;
+
+$("midi-edit").addEventListener("click", () => {
+  editMode = !editMode;
+  $("midi-edit").classList.toggle("active", editMode);
+  setLog(editMode
+    ? "Edit mode on — click a roll row to add a hit, click an existing hit to remove it"
+    : "Edit mode off");
+});
+
+const GRID_STEPS_Q = { "1/8": 0.5, "1/16": 0.25, "1/16T": 1 / 6, "1/32": 0.125 };
+
+function gentleSnap(t) {
+  // snap to the export grid when close to a gridline (30 % of a step), else place freely
+  if (!engine.tempo) return t;
+  const gridQ = GRID_STEPS_Q[$("out-grid").value] || 0.25;
+  const step = gridQ * 60 / engine.tempo;
+  const snapped = Math.round(t / step) * step;
+  return Math.abs(snapped - t) <= step * 0.3 ? snapped : t;
+}
+
 function toggleNote(x, y) {
   if (!roll.events) {
-    setLog("nothing to edit yet — run ADTOF first", true);
+    setLog("Nothing to edit yet — run the transcription first", true);
     return;
   }
   const wrap = $("roll-wrap");
   const rowH = wrap.clientHeight / ROLL_ORDER.length;
   const row = Math.min(ROLL_ORDER.length - 1, Math.max(0, Math.floor(y / rowH)));
   const cls = ROLL_ORDER[row];
-  const t = (roll.scrollPx + x) / engine.pxPerSec;
+  let t = (roll.scrollPx + x) / engine.pxPerSec;
   const tol = 6 / engine.pxPerSec;
   const arr = roll.events[cls];
-  const j = lowerBound(arr, t);
+  let j = lowerBound(arr, t);
   let hit = -1;
   if (j < arr.length && Math.abs(arr[j] - t) <= tol) hit = j;
   else if (j > 0 && Math.abs(arr[j - 1] - t) <= tol) hit = j - 1;
   if (hit >= 0) {
+    setLog("Removed " + cls + " hit at " + arr[hit].toFixed(3) + " s");
     arr.splice(hit, 1);
-    setLog("removed " + cls + " @ " + t.toFixed(3) + "s");
   } else {
+    t = Math.max(0, gentleSnap(t));
+    j = lowerBound(arr, t);
     arr.splice(j, 0, Math.round(t * 1e5) / 1e5);
     if (engine.started) engine.synths.trigger(cls, Tone.now());
-    setLog("added " + cls + " @ " + t.toFixed(3) + "s");
+    setLog("Added " + cls + " hit at " + t.toFixed(3) + " s");
   }
   rebuildPart(roll.events);
   updateCounts();
@@ -663,15 +837,14 @@ function pushEventsDebounced() {
     try {
       const r = await postJSON("/api/events/update", { events: roll.events });
       lastPickRev = r.rev;
-    } catch (e) { setLog("edit sync: " + e.message, true); }
+    } catch (e) { setLog("Edit sync failed: " + e.message, true); }
   }, 300);
 }
 
 function updateCounts() {
-  if (!roll.events) return;
   for (const c of CLASSES) {
     const el = $("count-" + c.id);
-    if (el) el.textContent = (roll.events[c.id] || []).length + "×";
+    if (el) el.textContent = roll.events ? (roll.events[c.id] || []).length + "×" : "";
   }
 }
 
@@ -691,7 +864,8 @@ async function fetchEvents() {
   const d = await api("/api/events");
   roll.events = d.events;
   engine.tempo = d.tempo;
-  $("tempo-display").textContent = "~" + d.tempo.toFixed(1) + " bpm";
+  $("tempo-display").textContent = d.tempo.toFixed(1) + " BPM";
+  $("out-tempo").textContent = "Detected tempo: " + d.tempo.toFixed(1) + " BPM (set your DAW session tempo to this)";
   rebuildPart(d.events);
   recomputeDuration();
   updateCounts();
@@ -699,13 +873,14 @@ async function fetchEvents() {
 }
 
 /* ------------------------------------------------------------------ */
-/* controls: threshold sliders                                         */
+/* threshold sliders                                                   */
 /* ------------------------------------------------------------------ */
 function buildSliders() {
   const host = $("sliders");
   for (const c of CLASSES) {
     const row = document.createElement("div");
     row.className = "slider-row";
+    row.title = "Detection threshold for " + c.label.toLowerCase() + " — lower finds more hits, higher fewer";
     row.innerHTML =
       '<span class="cls" style="color:' + COLORS[c.id] + '">' + c.label + "</span>" +
       '<input type="range" id="th-' + c.id + '" min="0" max="1" step="0.005" value="' + c.def + '">' +
@@ -743,7 +918,7 @@ async function runPick() {
     lastPickRev = r.rev;
     await fetchEvents();
   } catch (e) {
-    setLog("pick: " + e.message, true);
+    setLog("Threshold update failed: " + e.message, true);
   } finally {
     pickInFlight = false;
     if (pickQueued) { pickQueued = false; debouncedPick(); }
@@ -751,7 +926,7 @@ async function runPick() {
 }
 
 /* ------------------------------------------------------------------ */
-/* controls: upload / mode / run / stop                                */
+/* upload / mode                                                       */
 /* ------------------------------------------------------------------ */
 function getDevice() { return document.querySelector('input[name="device"]:checked').value; }
 function getMode() { return document.querySelector('input[name="entry"]:checked').value; }
@@ -777,14 +952,14 @@ function fmtDur(sec) {
 function renderInputMeta(input) {
   const dz = $("dropzone");
   if (!input) {
-    $("meta-display").textContent = "no file loaded";
+    $("meta-display").textContent = "No file loaded";
     $("file-name").innerHTML = "&nbsp;";
     $("file-meta").innerHTML = "&nbsp;";
     dz.classList.remove("has-art");
     dz.style.backgroundImage = "";
     return;
   }
-  const chs = input.channels === 1 ? "mono" : input.channels === 2 ? "stereo" : input.channels + "ch";
+  const chs = input.channels === 1 ? "mono" : input.channels === 2 ? "stereo" : input.channels + " ch";
   const parts = [
     (input.ext || "?").toUpperCase(),
     (input.samplerate / 1000).toFixed(1).replace(/\.0$/, "") + " kHz",
@@ -806,15 +981,15 @@ function renderInputMeta(input) {
 
 async function doUpload(file) {
   if (!file) return;
-  $("file-name").textContent = "uploading + converting …";
+  $("file-name").textContent = "Uploading and converting …";
   try {
     const fd = new FormData();
     fd.append("file", file);
     const r = await api("/api/upload", { method: "POST", body: fd });
-    setLog("uploaded " + r.input.name);
+    setLog("Loaded " + r.input.name);
   } catch (e) {
     $("file-name").innerHTML = "&nbsp;";
-    setLog("upload failed: " + e.message, true);
+    setLog("Upload failed: " + e.message, true);
   }
 }
 
@@ -828,72 +1003,112 @@ $("dropzone").addEventListener("drop", (e) => {
   doUpload(e.dataTransfer.files[0]);
 });
 
+/* ------------------------------------------------------------------ */
+/* run / stop / chaining                                               */
+/* ------------------------------------------------------------------ */
+function demucsParams() {
+  return {
+    model: $("dm-model").value,
+    shifts: parseInt($("dm-shifts").value || "0", 10),
+    overlap: parseFloat($("dm-overlap").value || "0.25"),
+    segment: $("dm-segment").value ? parseInt($("dm-segment").value, 10) : null,
+    device: getDevice(),
+  };
+}
+
+function adtofParams() {
+  return {
+    source: getMode() === "demucs" ? "stem" : "input",
+    fps: parseInt($("ad-fps").value || "100", 10),
+    thresholds: currentThresholds(),
+    device: getDevice(),
+  };
+}
+
+let chainAdtof = null; // transcription params waiting for separation to finish
+
 $("dm-run").addEventListener("click", async () => {
   try {
-    await postJSON("/api/demucs/run", {
-      model: $("dm-model").value,
-      shifts: parseInt($("dm-shifts").value || "0", 10),
-      overlap: parseFloat($("dm-overlap").value || "0.25"),
-      segment: $("dm-segment").value ? parseInt($("dm-segment").value, 10) : null,
-      device: getDevice(),
-    });
+    await postJSON("/api/demucs/run", demucsParams());
     poll(true);
-  } catch (e) { setLog("demucs: " + e.message, true); }
+  } catch (e) { setLog("Separation: " + e.message, true); }
 });
-$("dm-stop").addEventListener("click", () => postJSON("/api/demucs/stop", {}).catch(() => {}));
+$("dm-stop").addEventListener("click", () => { chainAdtof = null; postJSON("/api/demucs/stop", {}).catch(() => {}); });
 
 $("ad-run").addEventListener("click", async () => {
+  const params = adtofParams();
+  // in Song mode with no stem yet, run separation first and chain automatically
+  if (params.source === "stem" && !(lastState && lastState.stem)) {
+    try {
+      await postJSON("/api/demucs/run", demucsParams());
+      chainAdtof = params;
+      setLog("No drum stem yet — running separation first; transcription will follow automatically");
+      poll(true);
+    } catch (e) { setLog("Separation: " + e.message, true); }
+    return;
+  }
   try {
-    await postJSON("/api/adtof/run", {
-      source: getMode() === "demucs" ? "stem" : "input",
-      fps: parseInt($("ad-fps").value || "100", 10),
-      thresholds: currentThresholds(),
-      device: getDevice(),
-    });
+    await postJSON("/api/adtof/run", params);
     poll(true);
-  } catch (e) { setLog("adtof: " + e.message, true); }
+  } catch (e) { setLog("Transcription: " + e.message, true); }
 });
-$("ad-stop").addEventListener("click", () => postJSON("/api/adtof/stop", {}).catch(() => {}));
+$("ad-stop").addEventListener("click", () => { chainAdtof = null; postJSON("/api/adtof/stop", {}).catch(() => {}); });
 
-/* downloads */
-function bindDownload(btnId, kind) {
-  $(btnId).addEventListener("click", () => {
-    window.location.href = "/api/download/" + kind + "?grid=" + encodeURIComponent($("out-grid").value);
-  });
+/* ------------------------------------------------------------------ */
+/* exports / reset                                                     */
+/* ------------------------------------------------------------------ */
+function dlURL(kind) {
+  return "/api/download/" + kind +
+    "?grid=" + encodeURIComponent($("out-grid").value) +
+    "&fmt=" + encodeURIComponent($("out-fmt").value);
 }
-bindDownload("dl-stem", "stem");
-bindDownload("dl-midi", "midi");
-bindDownload("dl-midi-quant", "midi_quant");
-bindDownload("dl-musicxml", "musicxml");
 
-/* knobs */
+$("dl-stem").addEventListener("click", () => { window.location.href = dlURL("stem"); });
+$("dl-nodrums").addEventListener("click", () => { window.location.href = dlURL("nodrums"); });
+$("dl-midi").addEventListener("click", () => { window.location.href = dlURL("midi"); });
+$("dl-midi-quant").addEventListener("click", () => { window.location.href = dlURL("midi_quant"); });
+$("dl-musicxml").addEventListener("click", () => { window.location.href = dlURL("musicxml"); });
+$("dl-view-score").addEventListener("click", () => {
+  window.open("/static/score.html?grid=" + encodeURIComponent($("out-grid").value), "_blank");
+});
+
+$("btn-reset").addEventListener("click", async () => {
+  try {
+    await postJSON("/api/reset", {});
+    window.location.reload();
+  } catch (e) { setLog("Reset failed: " + e.message, true); }
+});
+
+/* ------------------------------------------------------------------ */
+/* knobs — logarithmic dB tapers; double-click resets to 0 dB          */
+/* ------------------------------------------------------------------ */
 const knobs = {
-  master: createKnob("knob-master", {
-    label: "master", size: 36, value: 1.0,
-    onChange: (v) => { master.gain.value = v; },
+  master: makeDbKnob("knob-master", {
+    label: "Master", size: 36, maxDb: 20,
+    onGain: (g) => { master.gain.value = g; },
   }),
-  input: createKnob("knob-input", {
-    label: "gain", size: 40, value: 0.9,
-    onChange: (v) => { laneGains.input.gain.value = v; },
+  input: makeDbKnob("knob-input", {
+    label: "Gain", size: 40, maxDb: 6,
+    onGain: (g) => { mix.input.gain = g; applyMix(); },
   }),
-  stem: createKnob("knob-stem", {
-    label: "gain", size: 40, value: 0.9,
-    onChange: (v) => { laneGains.stem.gain.value = v; },
+  stem: makeDbKnob("knob-stem", {
+    label: "Gain", size: 40, maxDb: 6, startDb: -Infinity,
+    onGain: (g) => { mix.stem.gain = g; applyMix(); },
   }),
-  nodrums: createKnob("knob-nodrums", {
-    label: "gain", size: 40, value: 0.9,
-    onChange: (v) => { laneGains.nodrums.gain.value = v; },
+  nodrums: makeDbKnob("knob-nodrums", {
+    label: "Gain", size: 40, maxDb: 6, startDb: -Infinity,
+    onGain: (g) => { mix.nodrums.gain = g; applyMix(); },
   }),
-  midi: createKnob("knob-midi", {
-    label: "midi", size: 36, value: 0.8,
-    onChange: (v) => { midiBus.gain.value = v; },
+  midi: makeDbKnob("knob-midi", {
+    label: "MIDI", size: 30, maxDb: 6,
+    onGain: (g) => { mix.midi.gain = g; applyMix(); },
   }),
 };
 for (const c of CLASSES) {
-  knobs[c.id] = createKnob("knob-" + c.id, {
-    label: c.label.slice(0, 3).toLowerCase(), size: 24, value: CLASS_GAIN_DEF[c.id],
+  knobs[c.id] = makeDbKnob("knob-" + c.id, {
+    label: c.label.slice(0, 3), size: 24, maxDb: 6,
     color: COLORS[c.id],
-    onChange: (v) => { classGains[c.id].gain.value = v; },
+    onGain: (g) => { classGains[c.id].gain.value = CLASS_TRIM[c.id] * g; },
   });
 }
 
@@ -913,6 +1128,7 @@ document.addEventListener("keydown", (e) => {
 let lastInputId = null;
 let lastStemKey = null;
 let lastPickRev = 0;
+let lastState = null;
 let pollTimer = null;
 
 function setLog(msg, isErr) {
@@ -923,7 +1139,7 @@ function setLog(msg, isErr) {
 
 function renderJob(prefix, job) {
   const chip = $(prefix + "-status");
-  chip.textContent = job.status;
+  chip.textContent = STATUS_LABEL[job.status] || job.status;
   chip.className = "chip " + job.status;
   $(prefix + "-msg").textContent = job.message || "";
   const bar = $(prefix + "-bar");
@@ -938,6 +1154,7 @@ async function poll(fast) {
   let running = false;
   try {
     const s = await api("/api/state");
+    lastState = s;
     renderJob("dm", s.jobs.demucs);
     renderJob("ad", s.jobs.adtof);
     running = s.jobs.demucs.status === "running" || s.jobs.adtof.status === "running";
@@ -952,34 +1169,50 @@ async function poll(fast) {
       disposeLane("nodrums");
       clearLoop();
       renderInputMeta(s.input);
+      updateCounts();
       $("tempo-display").textContent = "";
+      $("out-tempo").textContent = "";
       seekAll(0);
-      loadLane("input", "/api/audio/input?v=" + s.input.id).catch((e) => setLog("waveform: " + e.message, true));
+      loadLane("input", "/api/audio/input?v=" + s.input.id).catch((e) => setLog("Waveform failed: " + e.message, true));
     }
     if (s.stem && s.stem.key !== lastStemKey) {
       lastStemKey = s.stem.key;
-      loadLane("stem", "/api/audio/stem?v=" + s.stem.key).catch((e) => setLog("waveform: " + e.message, true));
+      loadLane("stem", "/api/audio/stem?v=" + s.stem.key).catch((e) => setLog("Waveform failed: " + e.message, true));
       if (s.stem.nodrums) {
-        loadLane("nodrums", "/api/audio/nodrums?v=" + s.stem.key).catch((e) => setLog("waveform: " + e.message, true));
+        loadLane("nodrums", "/api/audio/nodrums?v=" + s.stem.key).catch((e) => setLog("Waveform failed: " + e.message, true));
       }
     }
     if (s.pick && s.pick.rev !== lastPickRev) {
       lastPickRev = s.pick.rev;
-      fetchEvents().catch((e) => setLog("events: " + e.message, true));
+      fetchEvents().catch((e) => setLog("Event fetch failed: " + e.message, true));
+    }
+
+    // chained run: separation finished -> start transcription
+    if (chainAdtof) {
+      const dm = s.jobs.demucs.status;
+      if (dm === "done" && s.stem && s.jobs.adtof.status !== "running") {
+        const p = chainAdtof;
+        chainAdtof = null;
+        postJSON("/api/adtof/run", p).then(() => poll(true)).catch((e) => setLog("Transcription: " + e.message, true));
+      } else if (dm === "error" || dm === "cancelled") {
+        chainAdtof = null;
+      }
     }
 
     $("dl-stem").disabled = !s.stem;
+    $("dl-nodrums").disabled = !(s.stem && s.stem.nodrums);
     const havePick = !!s.pick;
     $("dl-midi").disabled = !havePick;
     $("dl-midi-quant").disabled = !havePick;
     $("dl-musicxml").disabled = !havePick;
+    $("dl-view-score").disabled = !havePick;
 
     const lastLog = (s.jobs.demucs.status === "running" ? s.jobs.demucs.log : s.jobs.adtof.log) || [];
     if (running && lastLog.length) setLog(lastLog[lastLog.length - 1]);
-    if (s.jobs.demucs.status === "error") setLog("demucs: " + s.jobs.demucs.message, true);
-    else if (s.jobs.adtof.status === "error") setLog("adtof: " + s.jobs.adtof.message, true);
+    if (s.jobs.demucs.status === "error") setLog("Separation: " + s.jobs.demucs.message, true);
+    else if (s.jobs.adtof.status === "error") setLog("Transcription: " + s.jobs.adtof.message, true);
   } catch (e) {
-    setLog("server unreachable: " + e.message, true);
+    setLog("Server unreachable: " + e.message, true);
   }
   pollTimer = setTimeout(poll, running || fast ? 400 : 1200);
 }
@@ -1005,15 +1238,16 @@ function raf() {
   for (const k of LANE_NAMES) {
     if (engine.lanes[k]) drawStereoMeter($("meter-" + k), taps[k].get(), false);
   }
+  drawStereoMeter($("meter-midi"), taps.midi.get(), false);
   requestAnimationFrame(raf);
 }
 
 /* init */
 buildSliders();
 engine.synths = makeSynths();
+applyMix();
 applyMode();
 applyZoom();
-new ResizeObserver(() => drawRoll()).observe($("roll-wrap"));
 poll(true);
 requestAnimationFrame(raf);
-setLog("drumlab ready — upload a file to start");
+setLog("DrumLab ready — drop a file to begin");

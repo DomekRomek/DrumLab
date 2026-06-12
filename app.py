@@ -126,7 +126,7 @@ class Job:
                 return False
             self.status = "running"
             self.progress = None
-            self.message = "starting ..."
+            self.message = "Starting ..."
             self.log.clear()
             self.cancelled = False
             self.thread = threading.Thread(target=target, args=args, daemon=True)
@@ -226,12 +226,12 @@ def stream_subprocess(job: Job, cmd: list, on_line=None) -> int:
 def classify_error(log_tail: str) -> str:
     low = log_tail.lower()
     if "out of memory" in low or "cuda oom" in low:
-        return "CUDA out of memory -- try the CPU toggle, or a smaller 'segment' value."
+        return "CUDA out of memory -- switch to CPU, or lower the segment value."
     if "longer segment" in low or "transformer model" in low and "segment" in low:
-        return "Segment too long for this model (htdemucs tops out around 7s) -- lower 'segment' or leave it blank."
+        return "Segment too long for this model (htdemucs caps at about 7 s) -- lower it or leave it empty."
     if "ffmpeg" in low or "could not load" in low or "decoding" in low or "soundfile" in low:
         return "Audio decode failed (FFmpeg) -- check the input file format."
-    return "stage failed -- see log below."
+    return "Stage failed -- see the log line below."
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +242,7 @@ def demucs_thread(params: dict) -> None:
     try:
         inp = STATE["input"]
         if not inp:
-            job.finish("error", "no input file uploaded")
+            job.finish("error", "No input file uploaded")
             return
         model = params["model"]
         shifts = int(params["shifts"])
@@ -259,7 +259,7 @@ def demucs_thread(params: dict) -> None:
                 STATE["stem"] = {"key": key, "wav": str(stem_path),
                                  "nodrums": str(nodrums_cached) if nodrums_cached.exists() else None}
             job.progress = 1.0
-            job.finish("done", "reused cached stem (same input + params)")
+            job.finish("done", "Reused cached stem (same input and parameters)")
             return
 
         tmp = DEMUCS_TMP / key
@@ -276,12 +276,12 @@ def demucs_thread(params: dict) -> None:
             cmd += ["--segment", str(int(segment))]
         cmd.append(inp["wav"])
 
-        job.message = f"separating with {model} on {device} ..."
+        job.message = f"Separating with {model} on {device} ..."
         rc = stream_subprocess(job, cmd)
 
         if job.cancelled:
             shutil.rmtree(tmp, ignore_errors=True)
-            job.finish("cancelled", "demucs cancelled -- process tree killed")
+            job.finish("cancelled", "Separation stopped -- process tree terminated")
             return
         if rc != 0:
             tail = "\n".join(list(job.log)[-8:])
@@ -290,7 +290,7 @@ def demucs_thread(params: dict) -> None:
 
         found = next(tmp.rglob("drums.wav"), None)
         if found is None:
-            job.finish("error", "demucs finished but no drums.wav was produced")
+            job.finish("error", "Separation finished but produced no drum stem")
             return
         stem_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(found), str(stem_path))
@@ -303,7 +303,7 @@ def demucs_thread(params: dict) -> None:
             STATE["stem"] = {"key": key, "wav": str(stem_path),
                              "nodrums": str(nodrums_path) if nodrums_path.exists() else None}
         job.progress = 1.0
-        job.finish("done", "drum stem ready")
+        job.finish("done", "Drum stem ready")
     except Exception as e:  # noqa: BLE001
         job.finish("error", f"demucs stage crashed: {e}")
 
@@ -359,27 +359,27 @@ def adtof_thread(params: dict) -> None:
 
         if source == "stem":
             if not STATE["stem"]:
-                job.finish("error", "no drum stem yet -- run Demucs first (or switch to ADTOF-direct)")
+                job.finish("error", "No drum stem yet -- run Separation first, or set the source to 'Drum stem'")
                 return
             wav = Path(STATE["stem"]["wav"])
         else:
             if not STATE["input"]:
-                job.finish("error", "no input file uploaded")
+                job.finish("error", "No input file uploaded")
                 return
             wav = Path(STATE["input"]["wav"])
 
-        job.message = "hashing source audio ..."
+        job.message = "Hashing source audio ..."
         key = f"{sha1_file(wav)}_fps{fps}"
         act_dir = ACTS / key
 
         if not (act_dir / "meta.json").exists():
             cmd = [PYEXE, str(WORKER), "--audio", str(wav), "--out-dir", str(act_dir),
                    "--device", device, "--fps", str(fps)]
-            job.message = f"running ADTOF net on {device} (cached after first run) ..."
+            job.message = f"Running the ADTOF network on {device} (cached after the first run) ..."
             rc = stream_subprocess(job, cmd)
             if job.cancelled:
                 shutil.rmtree(act_dir, ignore_errors=True)
-                job.finish("cancelled", "ADTOF cancelled -- worker killed")
+                job.finish("cancelled", "Transcription stopped -- worker terminated")
                 return
             if rc != 0 or not (act_dir / "meta.json").exists():
                 tail = "\n".join(list(job.log)[-8:])
@@ -395,11 +395,11 @@ def adtof_thread(params: dict) -> None:
                 "key": key, "dir": str(act_dir), "fps": meta["fps"],
                 "tempo": meta["tempo"], "duration": meta["duration"],
             }
-        job.message = "peak-picking ..."
+        job.message = "Peak-picking ..."
         pick = do_pick(thresholds)
         n = sum(pick["counts"].values())
         job.progress = 1.0
-        job.finish("done", f"{n} hits picked | tempo ~{meta['tempo']:.1f} bpm")
+        job.finish("done", f"{n} hits picked -- tempo about {meta['tempo']:.1f} BPM")
     except Exception as e:  # noqa: BLE001
         job.finish("error", f"ADTOF stage crashed: {e}")
 
@@ -410,7 +410,7 @@ def adtof_thread(params: dict) -> None:
 def require_pick() -> tuple:
     pick, acts = STATE["pick"], STATE["acts"]
     if not pick or not acts:
-        raise HTTPException(409, "no transcription yet -- run ADTOF first")
+        raise HTTPException(409, "No transcription yet -- run Transcription first")
     return pick, acts
 
 
@@ -519,10 +519,10 @@ def index():
 @app.post("/api/upload")
 def upload(file: UploadFile = File(...)):
     if DEMUCS_JOB.status == "running" or ADTOF_JOB.status == "running":
-        raise HTTPException(409, "a job is running -- stop it before changing the input")
+        raise HTTPException(409, "A job is running -- stop it before changing the input")
     data = file.file.read()
     if not data:
-        raise HTTPException(400, "empty upload")
+        raise HTTPException(400, "Empty upload")
     sha = hashlib.sha1(data).hexdigest()[:16]
     safe_stem = re.sub(r"[^\w\-. ]+", "_", Path(file.filename or "input").stem)[:60] or "input"
     suffix = Path(file.filename or "input.bin").suffix or ".bin"
@@ -574,9 +574,9 @@ def upload(file: UploadFile = File(...)):
 @app.post("/api/demucs/run")
 def demucs_run(params: dict):
     if not STATE["input"]:
-        raise HTTPException(409, "upload a file first")
+        raise HTTPException(409, "Upload a file first")
     if not DEMUCS_JOB.start(demucs_thread, (params,)):
-        raise HTTPException(409, "demucs already running")
+        raise HTTPException(409, "Separation is already running")
     return {"ok": True}
 
 
@@ -589,7 +589,7 @@ def demucs_stop():
 @app.post("/api/adtof/run")
 def adtof_run(params: dict):
     if not ADTOF_JOB.start(adtof_thread, (params,)):
-        raise HTTPException(409, "ADTOF already running")
+        raise HTTPException(409, "Transcription is already running")
     return {"ok": True}
 
 
@@ -603,7 +603,7 @@ def adtof_stop():
 def adtof_pick(params: dict):
     """Instant threshold re-pick on cached activations (no net run)."""
     if not STATE["acts"]:
-        raise HTTPException(409, "no cached activations -- run ADTOF first")
+        raise HTTPException(409, "No cached activations -- run Transcription first")
     try:
         pick = do_pick(params.get("thresholds", DEFAULT_THRESHOLDS))
     except RuntimeError as e:
@@ -641,14 +641,14 @@ def get_audio(which: str):
         return FileResponse(STATE["stem"]["wav"], media_type="audio/wav")
     if which == "nodrums" and STATE["stem"] and STATE["stem"].get("nodrums"):
         return FileResponse(STATE["stem"]["nodrums"], media_type="audio/wav")
-    raise HTTPException(404, f"no {which} audio available")
+    raise HTTPException(404, f"No {which} audio available")
 
 
 @app.get("/api/art")
 def get_art():
     if STATE["input"] and STATE["input"].get("art"):
         return FileResponse(UPLOADS / f"{STATE['input']['id']}_art.jpg", media_type="image/jpeg")
-    raise HTTPException(404, "no album art")
+    raise HTTPException(404, "No album art")
 
 
 @app.post("/api/events/update")
@@ -659,7 +659,7 @@ def events_update(params: dict):
     re-pick / ADTOF run overwrites them.
     """
     if not STATE["pick"]:
-        raise HTTPException(409, "no transcription to edit -- run ADTOF first")
+        raise HTTPException(409, "No transcription to edit -- run Transcription first")
     raw = params.get("events") or {}
     events = {}
     for cls in CH_NAMES:
@@ -675,15 +675,74 @@ def events_update(params: dict):
     return {"rev": PICK_REV[0], "counts": STATE["pick"]["counts"]}
 
 
+# stem download formats: ffmpeg args + (extension, mimetype)
+STEM_FMTS = {
+    "wav": ([], "wav", "audio/wav"),
+    "flac": (["-c:a", "flac"], "flac", "audio/flac"),
+    "ogg192": (["-c:a", "libvorbis", "-b:a", "192k"], "ogg", "audio/ogg"),
+    "ogg320": (["-c:a", "libvorbis", "-b:a", "320k"], "ogg", "audio/ogg"),
+}
+
+
+def stem_download(which: str, fmt: str):
+    stem = STATE["stem"]
+    if not stem:
+        raise HTTPException(409, "No separation output yet")
+    src = stem["wav"] if which == "drums" else stem.get("nodrums")
+    if not src:
+        raise HTTPException(409, f"No {which.replace(chr(95), chr(32))} stem available")
+    if fmt not in STEM_FMTS:
+        raise HTTPException(400, f"Invalid audio format -- use one of {list(STEM_FMTS)}")
+    args, ext, mime = STEM_FMTS[fmt]
+    nice = out_name(f"_{which}.{ext}")
+    if fmt == "wav":
+        return FileResponse(src, media_type=mime, filename=nice)
+    cached = OUT / f"{stem['key']}_{which}_{fmt}.{ext}"
+    if not cached.exists():
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", src] + args + [str(cached)],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=600,
+        )
+        if r.returncode != 0 or not cached.exists():
+            raise HTTPException(500, "FFmpeg conversion failed: " + r.stderr.decode("utf-8", "replace")[-300:])
+    return FileResponse(cached, media_type=mime, filename=nice)
+
+
+@app.post("/api/reset")
+def reset():
+    """Full reset: session state, jobs, and all on-disk caches."""
+    DEMUCS_JOB.cancel()
+    ADTOF_JOB.cancel()
+    if DEMUCS_JOB.thread and DEMUCS_JOB.thread.is_alive():
+        DEMUCS_JOB.thread.join(timeout=5)
+    if ADTOF_JOB.thread and ADTOF_JOB.thread.is_alive():
+        ADTOF_JOB.thread.join(timeout=5)
+    with STATE_LOCK:
+        STATE["input"] = None
+        STATE["stem"] = None
+        STATE["acts"] = None
+        STATE["pick"] = None
+    ACTS_RAM.clear()
+    for d in (UPLOADS, STEMS, ACTS, OUT, DEMUCS_TMP):
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True, exist_ok=True)
+    for job in (DEMUCS_JOB, ADTOF_JOB):
+        job.status = "idle"
+        job.progress = None
+        job.message = ""
+        job.log.clear()
+        job.cancelled = False
+    return {"ok": True}
+
+
 @app.get("/api/download/{kind}")
-def download(kind: str, grid: str = "1/16"):
+def download(kind: str, grid: str = "1/16", fmt: str = "wav"):
     if grid not in GRID_Q:
-        raise HTTPException(400, f"bad grid (use one of {list(GRID_Q)})")
+        raise HTTPException(400, f"Invalid grid -- use one of {list(GRID_Q)}")
     if kind == "stem":
-        if not STATE["stem"]:
-            raise HTTPException(409, "no drum stem yet")
-        return FileResponse(STATE["stem"]["wav"], media_type="audio/wav",
-                            filename=out_name("_drums.wav"))
+        return stem_download("drums", fmt)
+    if kind == "nodrums":
+        return stem_download("no_drums", fmt)
     pick, acts = require_pick()
     tempo = float(acts["tempo"])
     if kind == "midi":
@@ -703,7 +762,7 @@ def download(kind: str, grid: str = "1/16"):
             raise HTTPException(500, f"MusicXML export failed (music21): {e}")
         return FileResponse(path, media_type="application/vnd.recordare.musicxml+xml",
                             filename=path.name)
-    raise HTTPException(404, "unknown download kind")
+    raise HTTPException(404, "Unknown download kind")
 
 
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")

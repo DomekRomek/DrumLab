@@ -1,0 +1,11 @@
+# runtime caches and generated artifacts
+workdir/
+
+# python
+__pycache__/
+*.pyc
+
+# editor / OS noise
+.vscode/
+Thumbs.db
+desktop.ini
