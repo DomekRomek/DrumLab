@@ -251,6 +251,7 @@ const engine = {
   duration: 0,
   pxPerSec: 40,
   tempo: null,
+  speed: 1.0,  // playback rate (pitch preserved); content = speed * Transport.seconds
 };
 
 const master = new Tone.Gain(1.0);
@@ -277,7 +278,8 @@ function applyMix() {
   const anySolo = Object.values(mix).some((m) => m.solo);
   for (const k in mix) {
     const m = mix[k];
-    const audible = !m.mute && (!anySolo || m.solo);
+    // solo wins over mute: a soloed track is audible even if its mute is engaged
+    const audible = anySolo ? m.solo : !m.mute;
     m.node.gain.value = audible ? m.gain : 0;
   }
 }
@@ -307,8 +309,10 @@ const taps = {
 };
 
 /* ------------------------------------------------------------------ */
-/* drum synths                                                         */
+/* drum synths (+ optional user-loaded one-shot samples per instrument) */
 /* ------------------------------------------------------------------ */
+const customSamples = {}; // cls -> Tone.ToneAudioBuffer; overrides the synth voice
+
 function makeSynths() {
   const kick = new Tone.MembraneSynth({
     pitchDecay: 0.04, octaves: 6,
@@ -356,6 +360,13 @@ function makeSynths() {
   return {
     trigger(cls, time) {
       try {
+        const buf = customSamples[cls];
+        if (buf && buf.loaded) {
+          // user one-shot: plays at natural pitch/length (drum hits aren't time-stretched)
+          const src = new Tone.ToneBufferSource(buf).connect(classGains[cls]);
+          src.start(time);
+          return;
+        }
         if (cls === "kick") kick.triggerAttackRelease("C1", 0.25, time);
         else if (cls === "snare") {
           snareNoise.triggerAttackRelease(0.16, time, 1.0);
@@ -377,24 +388,36 @@ function disposeLane(name) {
   const lane = engine.lanes[name];
   if (!lane) return;
   try { lane.ws.destroy(); } catch (e) {}
-  try { lane.player.unsync(); lane.player.dispose(); } catch (e) {}
+  try { lane.player.stop(); lane.player.dispose(); } catch (e) {}
   engine.lanes[name] = null;
   $(LANE_CONT[name]).innerHTML = '<div class="placeholder">' + LANE_PLACEHOLDER[name] + "</div>";
 }
 
-function bufferPeak(toneBuffer) {
-  try {
-    const buf = toneBuffer.get();
-    let max = 0;
-    for (let ch = 0; ch < buf.numberOfChannels; ch++) {
-      const data = buf.getChannelData(ch);
-      for (let i = 0; i < data.length; i += 16) {
-        const v = Math.abs(data[i]);
-        if (v > max) max = v;
-      }
+// Log-compressed display peaks so quiet hits (hats) are visible instead of looking
+// like silence. Returns an interleaved [max,min,...] envelope for WaveSurfer to draw.
+function computeDisplayPeaks(toneBuffer, bins = 2400) {
+  let buf;
+  try { buf = toneBuffer.get(); } catch (e) { return null; }
+  if (!buf) return null;
+  const ch0 = buf.getChannelData(0);
+  const ch1 = buf.numberOfChannels > 1 ? buf.getChannelData(1) : null;
+  const N = ch0.length;
+  const per = Math.max(1, Math.floor(N / bins));
+  const out = new Float32Array(bins * 2);
+  const K = 40, denom = Math.log1p(K);
+  const comp = (x) => (x < 0 ? -1 : 1) * Math.log1p(K * Math.abs(x)) / denom;
+  for (let b = 0; b < bins; b++) {
+    let mn = 0, mx = 0;
+    const start = b * per, end = Math.min(N, start + per);
+    for (let i = start; i < end; i++) {
+      const v = ch1 ? (ch0[i] + ch1[i]) * 0.5 : ch0[i];
+      if (v > mx) mx = v;
+      if (v < mn) mn = v;
     }
-    return max;
-  } catch (e) { return 1; }
+    out[2 * b] = comp(mx);
+    out[2 * b + 1] = comp(mn);
+  }
+  return out;
 }
 
 async function loadLane(name, url) {
@@ -402,24 +425,25 @@ async function loadLane(name, url) {
   const cont = $(LANE_CONT[name]);
   cont.innerHTML = "";
 
-  const player = new Tone.Player();
-  await player.load(url);
+  // Tone owns audio playback (GrainPlayer = pitch-preserved speed); WaveSurfer is
+  // display-only, fed precomputed log-compressed peaks. One decode, no double-fetch.
+  const buffer = new Tone.ToneAudioBuffer();
+  await buffer.load(url);
+  const player = new Tone.GrainPlayer({ url: buffer, grainSize: 0.12, overlap: 0.08 });
+  player.playbackRate = engine.speed;
   player.connect(laneGains[name]);
-  player.sync().start(0);
 
-  // scale the waveform against the whole track's peak (not the visible window)
-  const peak = Math.max(bufferPeak(player.buffer), 0.01);
-
+  const peaks = computeDisplayPeaks(buffer);
   const ws = WaveSurfer.create({
     container: cont,
-    url: url,
+    peaks: peaks ? [peaks] : undefined,
+    duration: buffer.duration,
     height: Math.max(56, cont.clientHeight - 4),
     waveColor: LANE_COLORS[name].wave,
     progressColor: LANE_COLORS[name].prog,
     cursorColor: "#e8e8e8",
     cursorWidth: 1,
     normalize: false,
-    barHeight: Math.min(1 / peak, 20) * 0.95,
     interact: true,
     autoScroll: true,
     autoCenter: false,
@@ -430,8 +454,33 @@ async function loadLane(name, url) {
   ws.on("scroll", () => mirrorScroll(name));
   engine.lanes[name] = { ws, player, height: 0 };
 
+  if (Tone.Transport.state === "started") startLanePlayer(engine.lanes[name], nowContent());
   recomputeDuration();
-  setLog(LANE_LABEL[name] + " audio loaded (" + player.buffer.duration.toFixed(1) + " s)");
+  setLog(LANE_LABEL[name] + " audio loaded (" + buffer.duration.toFixed(1) + " s)");
+}
+
+/* manual audio drive — GrainPlayers are not transport-synced so speed can differ
+   from the clock. content position C = speed * Transport.seconds. */
+function laneList() {
+  return LANE_NAMES.map((k) => engine.lanes[k]).filter(Boolean);
+}
+function nowContent() {
+  return engine.speed * Tone.Transport.seconds;
+}
+function startLanePlayer(lane, offset) {
+  try { lane.player.stop(); } catch (e) {}
+  try {
+    lane.player.playbackRate = engine.speed;
+    if (offset < (lane.player.buffer ? lane.player.buffer.duration : Infinity)) {
+      lane.player.start(undefined, Math.max(0, offset));
+    }
+  } catch (e) {}
+}
+function startAudio(offset) {
+  for (const lane of laneList()) startLanePlayer(lane, offset);
+}
+function stopAudio() {
+  for (const lane of laneList()) { try { lane.player.stop(); } catch (e) {} }
 }
 
 function recomputeDuration() {
@@ -464,8 +513,11 @@ async function togglePlay() {
   await ensureAudio();
   if (Tone.Transport.state === "started") {
     Tone.Transport.pause();
+    stopAudio();
   } else {
-    if (engine.duration && Tone.Transport.seconds >= engine.duration - 0.05) Tone.Transport.seconds = 0;
+    let c = nowContent();
+    if (engine.duration && c >= engine.duration - 0.05) { c = 0; Tone.Transport.seconds = 0; }
+    startAudio(c);
     Tone.Transport.start();
   }
   renderPlayButton();
@@ -473,18 +525,30 @@ async function togglePlay() {
 
 function stopTransport() {
   Tone.Transport.pause();
+  stopAudio();
   Tone.Transport.seconds = 0;
   updateCursors(0);
   renderPlayButton();
 }
 
-function seekAll(t) {
-  t = Math.max(0, engine.duration ? Math.min(t, engine.duration) : t);
+function seekAll(c) {
+  c = Math.max(0, engine.duration ? Math.min(c, engine.duration) : c);
   const wasPlaying = Tone.Transport.state === "started";
-  if (wasPlaying) Tone.Transport.pause();
-  Tone.Transport.seconds = t;
-  updateCursors(t);
-  if (wasPlaying) Tone.Transport.start("+0.05");
+  if (wasPlaying) { Tone.Transport.pause(); stopAudio(); }
+  Tone.Transport.seconds = c / engine.speed;
+  updateCursors(c);
+  if (wasPlaying) { startAudio(c); Tone.Transport.start("+0.03"); }
+}
+
+function setSpeed(s) {
+  // change rate live without restarting audio: GrainPlayer rate is set in place and
+  // the clock is re-anchored so content position stays continuous.
+  const c = nowContent();
+  engine.speed = s;
+  for (const lane of laneList()) { try { lane.player.playbackRate = s; } catch (e) {} }
+  Tone.Transport.seconds = c / s;
+  rebuildPart(roll.events || {});
+  if (loop.active) { try { Tone.Transport.setLoopPoints(loop.start / s, loop.end / s); } catch (e) {} }
 }
 
 function updateCursors(t) {
@@ -521,13 +585,19 @@ function setLoop(a, b) {
   loop.start = a;
   loop.end = b;
   try {
-    Tone.Transport.setLoopPoints(a, b);
+    // loop points are in transport (real) seconds = content / speed
+    Tone.Transport.setLoopPoints(a / engine.speed, b / engine.speed);
     Tone.Transport.loop = true;
   } catch (e) {}
   $("loop-chip").classList.remove("hidden");
   $("loop-range").textContent = a.toFixed(2) + "–" + b.toFixed(2) + " s";
   $("loop-deselect").disabled = false;
 }
+
+// restart the audio players at the loop start when the transport wraps
+Tone.Transport.on("loop", () => {
+  if (Tone.Transport.state === "started") startAudio(loop.active ? loop.start : 0);
+});
 
 function clearLoop() {
   loop.active = false;
@@ -729,7 +799,7 @@ function drawRoll() {
     ctx.fillText(ROLL_LABEL[cls], 4, i * rowH + 11);
   }
 
-  const t = Tone.Transport.seconds;
+  const t = nowContent();
   const x = t * px - roll.scrollPx;
   if (x >= 0 && x <= W) {
     ctx.strokeStyle = "#e8e8e8";
@@ -862,7 +932,8 @@ function updateCounts() {
 function rebuildPart(events) {
   if (engine.part) { try { engine.part.dispose(); } catch (e) {} engine.part = null; }
   const flat = [];
-  for (const cls in events) for (const t of events[cls]) flat.push({ time: t, cls: cls });
+  // schedule in transport time = content time / speed, so MIDI tracks the audio rate
+  for (const cls in events) for (const t of events[cls]) flat.push({ time: t / engine.speed, cls: cls });
   flat.sort((a, b) => a.time - b.time);
   if (!flat.length) return;
   engine.part = new Tone.Part((time, ev) => engine.synths.trigger(ev.cls, time), flat).start(0);
@@ -1138,6 +1209,71 @@ for (const c of CLASSES) {
   });
 }
 
+// speed: linear taper, pitch preserved, double-click resets to 1.00x
+knobs.speed = createKnob("knob-speed", {
+  label: "Speed", size: 36, min: 0.5, max: 1.5, value: 1.0, resetValue: 1.0,
+  color: "#4ea1ff",
+  fmt: (v) => v.toFixed(2) + "×",
+  onChange: setSpeed,
+});
+
+/* ------------------------------------------------------------------ */
+/* custom drum samples — drag a one-shot onto a pad to replace the synth */
+/* ------------------------------------------------------------------ */
+function buildSampleSlots() {
+  const host = $("sample-slots");
+  for (const c of CLASSES) {
+    const row = document.createElement("div");
+    row.className = "sample-slot";
+    row.dataset.cls = c.id;
+    row.innerHTML =
+      '<span class="ss-name" style="color:' + COLORS[c.id] + '">' + c.label + "</span>" +
+      '<span class="ss-file">synth</span>' +
+      '<button class="ss-clear" title="Revert to the built-in synth" disabled>&#10005;</button>';
+    host.appendChild(row);
+
+    const picker = document.createElement("input");
+    picker.type = "file";
+    picker.accept = ".wav,.mp3,.flac,.m4a,.ogg,.aac,.aiff,.opus";
+    picker.hidden = true;
+    row.appendChild(picker);
+
+    const setFile = async (file) => {
+      if (!file) return;
+      try {
+        await ensureAudio();
+        const buf = new Tone.ToneAudioBuffer();
+        await buf.load(URL.createObjectURL(file));
+        if (customSamples[c.id]) { try { customSamples[c.id].dispose(); } catch (e) {} }
+        customSamples[c.id] = buf;
+        row.classList.add("loaded");
+        row.querySelector(".ss-file").textContent = file.name;
+        row.querySelector(".ss-clear").disabled = false;
+        engine.synths.trigger(c.id, Tone.now()); // audition
+        setLog("Loaded custom " + c.label.toLowerCase() + " sample: " + file.name);
+      } catch (e) { setLog("Sample load failed: " + e.message, true); }
+    };
+
+    row.querySelector(".ss-name").addEventListener("click", () => picker.click());
+    row.querySelector(".ss-file").addEventListener("click", () => picker.click());
+    picker.addEventListener("change", (e) => setFile(e.target.files[0]));
+    row.querySelector(".ss-clear").addEventListener("click", () => {
+      if (customSamples[c.id]) { try { customSamples[c.id].dispose(); } catch (e) {} }
+      delete customSamples[c.id];
+      row.classList.remove("loaded");
+      row.querySelector(".ss-file").textContent = "synth";
+      row.querySelector(".ss-clear").disabled = true;
+    });
+    row.addEventListener("dragover", (e) => { e.preventDefault(); row.classList.add("drag"); });
+    row.addEventListener("dragleave", () => row.classList.remove("drag"));
+    row.addEventListener("drop", (e) => {
+      e.preventDefault();
+      row.classList.remove("drag");
+      setFile(e.dataTransfer.files[0]);
+    });
+  }
+}
+
 /* transport buttons + keyboard */
 $("btn-play").addEventListener("click", togglePlay);
 $("btn-stop").addEventListener("click", stopTransport);
@@ -1199,6 +1335,7 @@ async function poll(fast) {
       $("tempo-display").textContent = "";
       $("out-tempo").textContent = "";
       $("out-bpm").value = "";
+      $("zoom").value = 0;  // fit the whole new file
       seekAll(0);
       loadLane("input", "/api/audio/input?v=" + s.input.id).catch((e) => setLog("Waveform failed: " + e.message, true));
     }
@@ -1255,13 +1392,14 @@ async function poll(fast) {
 /* render loop                                                         */
 /* ------------------------------------------------------------------ */
 function raf() {
-  const t = Tone.Transport.seconds;
+  const t = nowContent();
   $("time-display").textContent = fmtTime(t);
   if (Tone.Transport.state === "started") {
     updateCursors(t);
     if (!loop.active && engine.duration && t >= engine.duration) {
       Tone.Transport.pause();
-      Tone.Transport.seconds = engine.duration;
+      stopAudio();
+      Tone.Transport.seconds = engine.duration / engine.speed;
     }
   }
   renderPlayButton();
@@ -1278,6 +1416,7 @@ function raf() {
 
 /* init */
 buildSliders();
+buildSampleSlots();
 engine.synths = makeSynths();
 applyMix();
 applyMode();

@@ -29,6 +29,9 @@
     <button id="zoom-in" class="zoom-btn" title="Zoom in">+</button>
   </div>
   <button id="btn-reset" class="ghost-btn" title="Reset everything to a fresh state — clears the session and all cached results">Reset</button>
+  <div id="speed-wrap" title="Playback speed — pitch preserved. Double-click to reset to 1.00×.">
+    <div id="knob-speed"></div>
+  </div>
   <div id="master-wrap">
     <div id="knob-master"></div>
     <canvas id="master-meter" width="190" height="34" title="Master output level (dBFS, peak hold)"></canvas>
@@ -55,6 +58,10 @@
           <label><input type="radio" name="device" value="cuda" checked><span>CUDA</span></label>
           <label><input type="radio" name="device" value="cpu"><span>CPU</span></label>
         </div>
+      </div>
+      <div class="sample-pad" title="Drop a one-shot audio file on a pad to use it as that drum's sound instead of the built-in synth. Click the × to revert.">
+        <div class="sample-head">Custom samples</div>
+        <div id="sample-slots"></div>
       </div>
     </div>
   </div>
@@ -114,8 +121,11 @@
       </label>
       <label title="Audio format for the stem downloads">Audio
         <select id="out-fmt">
-          <option value="wav" selected>WAV</option>
-          <option value="flac">FLAC</option>
+          <option value="flac" selected>FLAC</option>
+          <option value="wav">WAV</option>
+          <option value="alac">ALAC (.m4a)</option>
+          <option value="aac">AAC (.m4a)</option>
+          <option value="aiff">AIFF</option>
           <option value="ogg192">OGG 192k</option>
           <option value="ogg320">OGG 320k</option>
         </select>

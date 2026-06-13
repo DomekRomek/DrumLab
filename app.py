@@ -702,12 +702,16 @@ def events_update(params: dict):
     return {"rev": PICK_REV[0], "counts": STATE["pick"]["counts"]}
 
 
-# stem download formats: ffmpeg args + (extension, mimetype)
+# stem download formats: ffmpeg args + (container extension, mimetype, name tag).
+# The name tag disambiguates formats that share a container (AAC/ALAC are both .m4a).
 STEM_FMTS = {
-    "wav": ([], "wav", "audio/wav"),
-    "flac": (["-c:a", "flac"], "flac", "audio/flac"),
-    "ogg192": (["-c:a", "libvorbis", "-b:a", "192k"], "ogg", "audio/ogg"),
-    "ogg320": (["-c:a", "libvorbis", "-b:a", "320k"], "ogg", "audio/ogg"),
+    "flac": (["-c:a", "flac"], "flac", "audio/flac", ""),
+    "wav": ([], "wav", "audio/wav", ""),
+    "aac": (["-c:a", "aac", "-b:a", "256k"], "m4a", "audio/mp4", "_aac"),
+    "alac": (["-c:a", "alac"], "m4a", "audio/mp4", "_alac"),
+    "aiff": (["-c:a", "pcm_s16be"], "aiff", "audio/aiff", ""),
+    "ogg192": (["-c:a", "libvorbis", "-b:a", "192k"], "ogg", "audio/ogg", "_192"),
+    "ogg320": (["-c:a", "libvorbis", "-b:a", "320k"], "ogg", "audio/ogg", "_320"),
 }
 
 
@@ -721,8 +725,8 @@ def stem_download(which: str, fmt: str):
         raise HTTPException(409, f"No {label} available")
     if fmt not in STEM_FMTS:
         raise HTTPException(400, f"Invalid audio format -- use one of {list(STEM_FMTS)}")
-    args, ext, mime = STEM_FMTS[fmt]
-    nice = out_name(f"_{which}.{ext}")
+    args, ext, mime, tag = STEM_FMTS[fmt]
+    nice = out_name(f"_{which}{tag}.{ext}")
     if fmt == "wav":
         return FileResponse(src, media_type=mime, filename=nice)
     cached = OUT / f"{stem['key']}_{which}_{fmt}.{ext}"
