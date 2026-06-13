@@ -455,11 +455,44 @@ async function loadLane(name, url) {
   });
   ws.on("interaction", (t) => seekAll(t));
   ws.on("scroll", () => mirrorScroll(name));
+  buildAmpAxis(cont);
   engine.lanes[name] = { ws, player, height: 0 };
 
   if (Tone.Transport.state === "started") startLanePlayer(engine.lanes[name], nowContent());
   recomputeDuration();
   setLog(LANE_LABEL[name] + " audio loaded (" + buffer.duration.toFixed(1) + " s)");
+}
+
+// dBFS reference lines, positioned through the same gamma the waveform uses so a
+// fixed dB step shrinks toward the centre — making the non-linear scale legible.
+const AMP_AXIS_DB = [-3, -6, -12, -24];
+function buildAmpAxis(cont) {
+  const axis = document.createElement("div");
+  axis.className = "amp-axis";
+  const unit = document.createElement("div");
+  unit.className = "amp-label amp-unit";
+  unit.textContent = "dBFS";
+  axis.appendChild(unit);
+  // 0 dBFS sits at the very top/bottom edges; draw a centre line for -inf
+  const mid = document.createElement("div");
+  mid.className = "amp-line zero";
+  mid.style.top = "50%";
+  axis.appendChild(mid);
+  for (const db of AMP_AXIS_DB) {
+    const frac = Math.pow(Math.pow(10, db / 20), DISPLAY_GAMMA); // 0..1 of half height
+    for (const sign of [-1, 1]) {
+      const line = document.createElement("div");
+      line.className = "amp-line";
+      line.style.top = (50 - sign * frac * 50) + "%";
+      axis.appendChild(line);
+    }
+    const label = document.createElement("div");
+    label.className = "amp-label";
+    label.style.top = (50 - frac * 50) + "%";
+    label.textContent = db;
+    axis.appendChild(label);
+  }
+  cont.appendChild(axis);
 }
 
 /* manual audio drive — GrainPlayers are not transport-synced so speed can differ
