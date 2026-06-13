@@ -1058,15 +1058,20 @@ async function runPick() {
 /* upload / mode                                                       */
 /* ------------------------------------------------------------------ */
 function getDevice() { return document.querySelector('input[name="device"]:checked').value; }
-function getMode() { return document.querySelector('input[name="entry"]:checked').value; }
 
-function applyMode() {
-  const direct = getMode() === "direct";
-  $("panel-demucs").classList.toggle("disabled", direct);
-  $("lane-stem").classList.toggle("hidden", direct);
-  $("lane-nodrums").classList.toggle("hidden", direct);
+/* per-stage show/hide via the eye toggles: collapse the panel + hide its tracks */
+function bindStageEye(eyeId, panelId, laneIds) {
+  const eye = $(eyeId);
+  let hidden = false;
+  eye.addEventListener("click", () => {
+    hidden = !hidden;
+    eye.classList.toggle("off", hidden);
+    $(panelId).classList.toggle("collapsed", hidden);
+    for (const id of laneIds) $(id).classList.toggle("hidden", hidden);
+  });
 }
-document.querySelectorAll('input[name="entry"]').forEach((r) => r.addEventListener("change", applyMode));
+bindStageEye("dm-eye", "panel-demucs", ["lane-stem", "lane-nodrums"]);
+bindStageEye("ad-eye", "panel-adtof", ["lane-midi"]);
 
 function fmtSize(bytes) {
   if (bytes >= 1 << 20) return (bytes / (1 << 20)).toFixed(1) + " MB";
@@ -1146,9 +1151,9 @@ function demucsParams() {
   };
 }
 
-function adtofParams() {
+function adtofParams(source) {
   return {
-    source: getMode() === "demucs" ? "stem" : "input",
+    source: source,
     fps: parseInt($("ad-fps").value || "100", 10),
     thresholds: currentThresholds(),
     device: getDevice(),
@@ -1165,10 +1170,18 @@ $("dm-run").addEventListener("click", async () => {
 });
 $("dm-stop").addEventListener("click", () => { chainAdtof = null; postJSON("/api/demucs/stop", {}).catch(() => {}); });
 
+// Run: transcribe the raw input directly (ADTOF works best on the full mix)
 $("ad-run").addEventListener("click", async () => {
-  const params = adtofParams();
-  // in Song mode with no stem yet, run separation first and chain automatically
-  if (params.source === "stem" && !(lastState && lastState.stem)) {
+  try {
+    await postJSON("/api/adtof/run", adtofParams("input"));
+    poll(true);
+  } catch (e) { setLog("Transcription: " + e.message, true); }
+});
+
+// From stem: transcribe the Demucs drum stem — run separation first if there isn't one
+$("ad-run-stem").addEventListener("click", async () => {
+  const params = adtofParams("stem");
+  if (!(lastState && lastState.stem)) {
     try {
       await postJSON("/api/demucs/run", demucsParams());
       chainAdtof = params;
@@ -1188,9 +1201,12 @@ $("ad-stop").addEventListener("click", () => { chainAdtof = null; postJSON("/api
 /* exports / reset                                                     */
 /* ------------------------------------------------------------------ */
 function dlURL(kind) {
+  // "Match playback speed" time-stretches the export to the Speed knob setting
+  const speed = $("out-speed").checked ? engine.speed : 1;
   return "/api/download/" + kind +
     "?grid=" + encodeURIComponent($("out-grid").value) +
-    "&fmt=" + encodeURIComponent($("out-fmt").value);
+    "&fmt=" + encodeURIComponent($("out-fmt").value) +
+    "&speed=" + speed.toFixed(4);
 }
 
 $("dl-stem").addEventListener("click", () => { window.location.href = dlURL("stem"); });
@@ -1356,6 +1372,7 @@ function renderJob(prefix, job) {
   bar.style.opacity = job.progress != null || job.status !== "running" ? "1" : "0.35";
   $(prefix + "-run").disabled = job.status === "running";
   $(prefix + "-stop").disabled = job.status !== "running";
+  if (prefix === "ad") $("ad-run-stem").disabled = job.status === "running";
 }
 
 async function poll(fast) {
@@ -1466,7 +1483,6 @@ buildSliders();
 buildSampleSlots();
 engine.synths = makeSynths();
 applyMix();
-applyMode();
 applyZoom();
 poll(true);
 requestAnimationFrame(raf);

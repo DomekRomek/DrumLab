@@ -716,7 +716,7 @@ STEM_FMTS = {
 }
 
 
-def stem_download(which: str, fmt: str):
+def stem_download(which: str, fmt: str, speed: float = 1.0):
     label = "drum stem" if which == "drums" else "backing track"
     stem = STATE["stem"]
     if not stem:
@@ -727,13 +727,17 @@ def stem_download(which: str, fmt: str):
     if fmt not in STEM_FMTS:
         raise HTTPException(400, f"Invalid audio format -- use one of {list(STEM_FMTS)}")
     args, ext, mime, tag = STEM_FMTS[fmt]
-    nice = out_name(f"_{which}{tag}.{ext}")
-    if fmt == "wav":
+    stretch = abs(speed - 1.0) > 1e-3
+    stag = f"_{speed:g}x" if stretch else ""
+    nice = out_name(f"_{which}{tag}{stag}.{ext}")
+    if fmt == "wav" and not stretch:
         return FileResponse(src, media_type=mime, filename=nice)
-    cached = OUT / f"{stem['key']}_{which}_{fmt}.{ext}"
+    cached = OUT / f"{stem['key']}_{which}_{fmt}{stag}.{ext}"
     if not cached.exists():
+        # atempo time-stretches with pitch preserved; matches the Speed-knob playback
+        filt = ["-filter:a", f"atempo={speed:.4f}"] if stretch else []
         r = subprocess.run(
-            ["ffmpeg", "-y", "-i", src] + args + [str(cached)],
+            ["ffmpeg", "-y", "-i", src] + filt + args + [str(cached)],
             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=600,
         )
         if r.returncode != 0 or not cached.exists():
@@ -765,28 +769,40 @@ def reset():
 
 
 @app.get("/api/download/{kind}")
-def download(kind: str, grid: str = "1/16", fmt: str = "wav"):
+def download(kind: str, grid: str = "1/16", fmt: str = "wav", speed: float = 1.0):
     if grid not in GRID_Q:
         raise HTTPException(400, f"Invalid grid -- use one of {list(GRID_Q)}")
+    speed = max(0.5, min(2.0, float(speed)))  # atempo's single-pass range
     if kind == "stem":
-        return stem_download("drums", fmt)
+        return stem_download("drums", fmt, speed)
     if kind == "nodrums":
-        return stem_download("no_drums", fmt)
+        return stem_download("no_drums", fmt, speed)
     pick, acts = require_pick()
     tempo = effective_tempo(acts)
+    # "Match playback speed": stretch event times by 1/speed and the embedded tempo by
+    # speed, so the MIDI lines up with the speed-stretched audio. Quantization slots are
+    # unchanged (the speed cancels), so the notation is identical, only the tempo differs.
+    stretch = abs(speed - 1.0) > 1e-3
+    if stretch:
+        events = {cls: [t / speed for t in times] for cls, times in pick["events"].items()}
+        tempo *= speed
+        stag = f"_{speed:g}x"
+    else:
+        events = pick["events"]
+        stag = ""
     if kind == "midi":
-        path = OUT / out_name("_adtof_raw.mid")
-        build_midi(pick["events"], tempo, path)
+        path = OUT / out_name(f"_adtof_raw{stag}.mid")
+        build_midi(events, tempo, path)
         return FileResponse(path, media_type="audio/midi", filename=path.name)
     if kind == "midi_quant":
         gtag = grid.replace("/", "")
-        path = OUT / out_name(f"_adtof_q{gtag}.mid")
-        build_quant_midi(pick["events"], tempo, grid, path)
+        path = OUT / out_name(f"_adtof_q{gtag}{stag}.mid")
+        build_quant_midi(events, tempo, grid, path)
         return FileResponse(path, media_type="audio/midi", filename=path.name)
     if kind == "musicxml":
-        path = OUT / out_name("_adtof.musicxml")
+        path = OUT / out_name(f"_adtof{stag}.musicxml")
         try:
-            build_musicxml(pick["events"], tempo, grid, path)
+            build_musicxml(events, tempo, grid, path)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"MusicXML export failed (music21): {e}")
         return FileResponse(path, media_type="application/vnd.recordare.musicxml+xml",

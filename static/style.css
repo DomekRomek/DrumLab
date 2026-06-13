@@ -171,6 +171,22 @@ button.t-stop { background: var(--stop); }
 #panel-out { flex: 1 1 240px; }
 .panel > h2 { flex: none; }
 .panel.disabled { opacity: 0.45; pointer-events: none; }
+
+/* stage header with an eye toggle that collapses the panel + hides its tracks */
+.panel-head { display: flex; align-items: center; gap: 8px; }
+.eye-btn {
+  margin-left: auto; flex: none; width: 24px; height: 22px; padding: 0;
+  background: none; border: none; color: var(--dim); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; border-radius: 4px;
+}
+.eye-btn:hover { color: var(--accent); }
+.eye-btn .slash { display: none; }
+.eye-btn.off { color: var(--accent); }
+.eye-btn.off .slash { display: inline; }
+.panel.collapsed { opacity: 0.55; align-self: flex-start; }
+.panel.collapsed > :not(.panel-head) { display: none; }
+.panel.collapsed .panel-head { margin-bottom: 0; }
+.panel.collapsed .eye-btn { opacity: 1; }   /* keep the toggle usable */
 .row { display: flex; align-items: center; gap: 12px; margin: 6px 0; flex-wrap: wrap; }
 .row label { display: inline-flex; align-items: center; gap: 5px; }
 .row.nums input[type=number] { width: 62px; }
@@ -180,6 +196,11 @@ button.run, button.stop {
   font-weight: 600; cursor: pointer; color: #fff;
 }
 button.run { background: var(--run); }
+button.run.alt {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--accent);
+  white-space: nowrap; font-weight: 500;
+}
+button.run.alt:hover:not(:disabled) { background: var(--accent); color: #0d1117; }
 button.stop { background: var(--stop); }
 button:disabled { opacity: 0.4; cursor: default; }
 

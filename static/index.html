@@ -54,10 +54,6 @@
       </div>
       <input type="file" id="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,.aiff,.opus" hidden>
       <div class="input-right">
-        <div class="seg" id="entry-sel">
-          <label title="The file is a full song — separate the drums first, then transcribe the stem"><input type="radio" name="entry" value="demucs" checked><span>Song</span></label>
-          <label title="The file is already isolated drum audio — skip separation and transcribe it directly"><input type="radio" name="entry" value="direct"><span>Drum stem</span></label>
-        </div>
         <div id="file-name" class="hint">&nbsp;</div>
         <div id="file-meta" class="hint">&nbsp;</div>
         <div class="seg" id="device-sel" title="Compute device for both stages. CUDA uses the GPU; CPU is slower but a fallback for out-of-memory errors">
@@ -73,7 +69,15 @@
   </div>
 
   <div class="panel" id="panel-demucs">
-    <h2>1 &middot; Separation &mdash; Demucs <span class="chip" id="dm-status">Idle</span></h2>
+    <h2 class="panel-head"><span>Separation &mdash; Demucs</span> <span class="chip" id="dm-status">Idle</span>
+      <button class="eye-btn" id="dm-eye" title="Show / hide this stage and its drum + backing tracks">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
+          <path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/>
+          <circle cx="8" cy="8" r="1.9" fill="currentColor" stroke="none"/>
+          <line class="slash" x1="2.5" y1="13.5" x2="13.5" y2="2.5"/>
+        </svg>
+      </button>
+    </h2>
     <div class="row">
       <label title="Separation model. htdemucs: default hybrid transformer. htdemucs_ft: fine-tuned variant, slower but slightly cleaner. mdx_extra / mdx_extra_q: older MDX models (q = quantized, smaller).">Model
         <select id="dm-model">
@@ -98,7 +102,15 @@
   </div>
 
   <div class="panel" id="panel-adtof">
-    <h2>2 &middot; Transcription &mdash; ADTOF <span class="chip" id="ad-status">Idle</span></h2>
+    <h2 class="panel-head"><span>Transcription &mdash; ADTOF</span> <span class="chip" id="ad-status">Idle</span>
+      <button class="eye-btn" id="ad-eye" title="Show / hide this stage and its MIDI track">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
+          <path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/>
+          <circle cx="8" cy="8" r="1.9" fill="currentColor" stroke="none"/>
+          <line class="slash" x1="2.5" y1="13.5" x2="13.5" y2="2.5"/>
+        </svg>
+      </button>
+    </h2>
     <div class="adtof-cols">
       <div id="sliders"></div>
       <div class="adtof-side">
@@ -106,7 +118,8 @@
         <label class="switch" title="Re-detect hits from the cached activation curves on every slider move. Instant — the network is not re-run.">
           <input type="checkbox" id="ad-live"><span class="track"></span> Auto-apply
         </label>
-        <button id="ad-run" class="run">Run</button>
+        <button id="ad-run" class="run" title="Transcribe the input audio directly (ADTOF works best on the raw mix)">Run</button>
+        <button id="ad-run-stem" class="run alt" title="Transcribe the Demucs drum stem instead. Runs separation first if needed.">From stem &#8631;</button>
         <button id="ad-stop" class="stop" disabled>Stop</button>
       </div>
     </div>
@@ -138,6 +151,11 @@
       </label>
       <label title="Manual tempo for the exports and score. Leave empty to use the detected tempo.">BPM
         <input type="number" id="out-bpm" min="20" max="400" step="0.1" placeholder="auto">
+      </label>
+    </div>
+    <div class="row">
+      <label class="switch" title="Export the audio and MIDI time-stretched to the current Speed knob setting (pitch preserved), so the downloads match your slowed-down practice playback.">
+        <input type="checkbox" id="out-speed"><span class="track"></span> Match playback speed
       </label>
     </div>
     <div class="dl-list">
