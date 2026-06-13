@@ -400,6 +400,15 @@ function disposeLane(name) {
 // quiet detail (hats) without turning loud masters into a solid block — a true dB
 // taper over-compresses and does exactly that.
 const DISPLAY_GAMMA = 0.65;
+const DISPLAY_CEIL_DB = 3;   // headroom above 0 dBFS, so over-full-scale (clipping) peaks show
+const DISPLAY_NORM = Math.pow(Math.pow(10, DISPLAY_CEIL_DB / 20), DISPLAY_GAMMA);
+// magnitude (0..~1+) -> display fraction of half-height (0..1); edge = +CEIL dBFS
+function warpAmp(mag) {
+  return Math.min(1, Math.pow(mag, DISPLAY_GAMMA) / DISPLAY_NORM);
+}
+function dbToFracAmp(db) {
+  return warpAmp(Math.pow(10, db / 20));
+}
 function computeDisplayPeaks(toneBuffer) {
   let buf;
   try { buf = toneBuffer.get(); } catch (e) { return null; }
@@ -418,7 +427,7 @@ function computeDisplayPeaks(toneBuffer) {
       const v = ch1 ? Math.max(Math.abs(ch0[i]), Math.abs(ch1[i])) : Math.abs(ch0[i]);
       if (v > mx) mx = v;
     }
-    out[b] = Math.pow(mx, DISPLAY_GAMMA);
+    out[b] = warpAmp(mx);
   }
   return out;
 }
@@ -463,9 +472,10 @@ async function loadLane(name, url) {
   setLog(LANE_LABEL[name] + " audio loaded (" + buffer.duration.toFixed(1) + " s)");
 }
 
-// dBFS reference lines, positioned through the same gamma the waveform uses so a
-// fixed dB step shrinks toward the centre — making the non-linear scale legible.
-const AMP_AXIS_DB = [-3, -6, -12, -24];
+// dBFS reference lines through the same warp as the waveform. Even 6 dB steps so the
+// spacing compresses monotonically toward the centre — the correct logarithmic look.
+// 0 dBFS is an interior "clip" line; the band above it (to +CEIL dBFS) is headroom.
+const AMP_AXIS_DB = [0, -6, -12, -18, -24];
 function buildAmpAxis(cont) {
   const axis = document.createElement("div");
   axis.className = "amp-axis";
@@ -473,23 +483,24 @@ function buildAmpAxis(cont) {
   unit.className = "amp-label amp-unit";
   unit.textContent = "dBFS";
   axis.appendChild(unit);
-  // 0 dBFS sits at the very top/bottom edges; draw a centre line for -inf
+  // centre line = zero amplitude (-inf dBFS)
   const mid = document.createElement("div");
   mid.className = "amp-line zero";
   mid.style.top = "50%";
   axis.appendChild(mid);
   for (const db of AMP_AXIS_DB) {
-    const frac = Math.pow(Math.pow(10, db / 20), DISPLAY_GAMMA); // 0..1 of half height
+    const frac = dbToFracAmp(db); // 0..1 of half height
+    const cls = db === 0 ? "amp-line clip" : "amp-line";
     for (const sign of [-1, 1]) {
       const line = document.createElement("div");
-      line.className = "amp-line";
+      line.className = cls;
       line.style.top = (50 - sign * frac * 50) + "%";
       axis.appendChild(line);
     }
     const label = document.createElement("div");
-    label.className = "amp-label";
+    label.className = db === 0 ? "amp-label clip" : "amp-label";
     label.style.top = (50 - frac * 50) + "%";
-    label.textContent = db;
+    label.textContent = db === 0 ? "0" : db;
     axis.appendChild(label);
   }
   cont.appendChild(axis);
