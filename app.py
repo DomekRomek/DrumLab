@@ -3,7 +3,7 @@ r"""DRUMLAB -- local drum-transcription control GUI
 
 Wraps the Demucs -> ADTOF pipeline in a hands-on local web UI:
 manual Run/Stop per stage, cached activations with instant threshold
-re-picking, three time-aligned lanes (input / stem / MIDI piano-roll),
+re-picking, four time-aligned lanes (input / drums / backing / MIDI roll),
 and Ardour-ready MIDI + quantized MIDI + MusicXML downloads.
 
 INSTALL (inside the existing venv -- do NOT let pip touch torch):
@@ -44,9 +44,10 @@ from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+APP_VERSION = "1.0"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -126,7 +127,7 @@ class Job:
                 return False
             self.status = "running"
             self.progress = None
-            self.message = "starting ..."
+            self.message = "Starting ..."
             self.log.clear()
             self.cancelled = False
             self.thread = threading.Thread(target=target, args=args, daemon=True)
@@ -157,12 +158,22 @@ class Job:
 DEMUCS_JOB = Job("demucs")
 ADTOF_JOB = Job("adtof")
 
+
+def reset_jobs() -> None:
+    for job in (DEMUCS_JOB, ADTOF_JOB):
+        job.status = "idle"
+        job.progress = None
+        job.message = ""
+        job.log.clear()
+        job.cancelled = False
+
 STATE_LOCK = threading.Lock()
 STATE = {
     "input": None,  # {"id", "name", "stem_name", "wav", "duration"}
-    "stem": None,   # {"key", "wav"}
+    "stem": None,   # {"key", "wav", "nodrums"}
     "acts": None,   # {"key", "dir", "fps", "tempo", "duration"}
     "pick": None,   # {"rev", "thresholds", "fps", "events", "counts"}
+    "tempo_override": None,  # manual BPM; None = use the detected tempo
 }
 PICK_REV = [0]
 ACTS_RAM: "OrderedDict[str, np.ndarray]" = OrderedDict()  # small LRU of activation arrays
@@ -176,7 +187,7 @@ def sha1_file(path: Path) -> str:
     return h.hexdigest()[:16]
 
 
-def stream_subprocess(job: Job, cmd: list, on_line=None) -> int:
+def stream_subprocess(job: Job, cmd: list) -> int:
     """Run cmd, streaming combined output into job.log / job.progress.
 
     Returns the process return code. Honors job.cancelled via kill_tree.
@@ -193,7 +204,8 @@ def stream_subprocess(job: Job, cmd: list, on_line=None) -> int:
         if job.cancelled:  # stop raced with start
             kill_tree(proc)
     partial = ""
-    pct_re = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+    # match tqdm-style " 42%|####  " only, so stray percentages in logs don't fake progress
+    pct_re = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%\s*\|")
     while True:
         chunk = proc.stdout.read(4096)
         if not chunk:
@@ -216,8 +228,6 @@ def stream_subprocess(job: Job, cmd: list, on_line=None) -> int:
             else:
                 job.log.append(piece[:300])
                 job.message = piece[:160]
-                if on_line:
-                    on_line(piece)
     proc.wait()
     return proc.returncode
 
@@ -225,12 +235,12 @@ def stream_subprocess(job: Job, cmd: list, on_line=None) -> int:
 def classify_error(log_tail: str) -> str:
     low = log_tail.lower()
     if "out of memory" in low or "cuda oom" in low:
-        return "CUDA out of memory -- try the CPU toggle, or a smaller 'segment' value."
-    if "longer segment" in low or "transformer model" in low and "segment" in low:
-        return "Segment too long for this model (htdemucs tops out around 7s) -- lower 'segment' or leave it blank."
+        return "CUDA out of memory -- switch to CPU, or lower the segment value."
+    if "longer segment" in low or ("transformer model" in low and "segment" in low):
+        return "Segment too long for this model (htdemucs caps at about 7 s) -- lower it or leave it empty."
     if "ffmpeg" in low or "could not load" in low or "decoding" in low or "soundfile" in low:
         return "Audio decode failed (FFmpeg) -- check the input file format."
-    return "stage failed -- see log below."
+    return "Stage failed -- see the log line below."
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +251,7 @@ def demucs_thread(params: dict) -> None:
     try:
         inp = STATE["input"]
         if not inp:
-            job.finish("error", "no input file uploaded")
+            job.finish("error", "No input file uploaded")
             return
         model = params["model"]
         shifts = int(params["shifts"])
@@ -253,10 +263,12 @@ def demucs_thread(params: dict) -> None:
         stem_path = STEMS / key / "drums.wav"
 
         if stem_path.exists():
+            nodrums_cached = stem_path.parent / "no_drums.wav"
             with STATE_LOCK:
-                STATE["stem"] = {"key": key, "wav": str(stem_path)}
+                STATE["stem"] = {"key": key, "wav": str(stem_path),
+                                 "nodrums": str(nodrums_cached) if nodrums_cached.exists() else None}
             job.progress = 1.0
-            job.finish("done", "reused cached stem (same input + params)")
+            job.finish("done", "Reused cached stem (same input and parameters)")
             return
 
         tmp = DEMUCS_TMP / key
@@ -273,12 +285,12 @@ def demucs_thread(params: dict) -> None:
             cmd += ["--segment", str(int(segment))]
         cmd.append(inp["wav"])
 
-        job.message = f"separating with {model} on {device} ..."
+        job.message = f"Separating with {model} on {device} ..."
         rc = stream_subprocess(job, cmd)
 
         if job.cancelled:
             shutil.rmtree(tmp, ignore_errors=True)
-            job.finish("cancelled", "demucs cancelled -- process tree killed")
+            job.finish("cancelled", "Separation stopped -- process tree terminated")
             return
         if rc != 0:
             tail = "\n".join(list(job.log)[-8:])
@@ -287,17 +299,22 @@ def demucs_thread(params: dict) -> None:
 
         found = next(tmp.rglob("drums.wav"), None)
         if found is None:
-            job.finish("error", "demucs finished but no drums.wav was produced")
+            job.finish("error", "Separation finished but produced no drum stem")
             return
         stem_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(found), str(stem_path))
+        found_nd = next(tmp.rglob("no_drums.wav"), None)
+        nodrums_path = stem_path.parent / "no_drums.wav"
+        if found_nd is not None:
+            shutil.move(str(found_nd), str(nodrums_path))
         shutil.rmtree(tmp, ignore_errors=True)
         with STATE_LOCK:
-            STATE["stem"] = {"key": key, "wav": str(stem_path)}
+            STATE["stem"] = {"key": key, "wav": str(stem_path),
+                             "nodrums": str(nodrums_path) if nodrums_path.exists() else None}
         job.progress = 1.0
-        job.finish("done", "drum stem ready")
+        job.finish("done", "Drum stem ready")
     except Exception as e:  # noqa: BLE001
-        job.finish("error", f"demucs stage crashed: {e}")
+        job.finish("error", f"Separation stage crashed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -321,10 +338,10 @@ def do_pick(thresholds: dict) -> dict:
     """Peak-pick the cached activation curves. Milliseconds; no net run."""
     acts_info = STATE["acts"]
     if not acts_info:
-        raise RuntimeError("no cached activations -- run ADTOF first")
+        raise RuntimeError("No cached activations -- run Transcription first")
     arr = load_acts(acts_info["key"])
     if arr is None:
-        raise RuntimeError("activation cache missing on disk -- re-run ADTOF")
+        raise RuntimeError("Activation cache missing on disk -- re-run Transcription")
     th = [float(thresholds.get(n, DEFAULT_THRESHOLDS[n])) for n in CH_NAMES]
     picker = PP.PeakPicker(thresholds=th, fps=int(acts_info["fps"]))
     picked = picker.pick(arr, labels=list(range(5)), label_offset=0)[0]
@@ -351,27 +368,27 @@ def adtof_thread(params: dict) -> None:
 
         if source == "stem":
             if not STATE["stem"]:
-                job.finish("error", "no drum stem yet -- run Demucs first (or switch to ADTOF-direct)")
+                job.finish("error", "No drum stem yet -- run Separation first, or set the source to 'Drum stem'")
                 return
             wav = Path(STATE["stem"]["wav"])
         else:
             if not STATE["input"]:
-                job.finish("error", "no input file uploaded")
+                job.finish("error", "No input file uploaded")
                 return
             wav = Path(STATE["input"]["wav"])
 
-        job.message = "hashing source audio ..."
+        job.message = "Hashing source audio ..."
         key = f"{sha1_file(wav)}_fps{fps}"
         act_dir = ACTS / key
 
         if not (act_dir / "meta.json").exists():
             cmd = [PYEXE, str(WORKER), "--audio", str(wav), "--out-dir", str(act_dir),
                    "--device", device, "--fps", str(fps)]
-            job.message = f"running ADTOF net on {device} (cached after first run) ..."
+            job.message = f"Running the ADTOF network on {device} (cached after the first run) ..."
             rc = stream_subprocess(job, cmd)
             if job.cancelled:
                 shutil.rmtree(act_dir, ignore_errors=True)
-                job.finish("cancelled", "ADTOF cancelled -- worker killed")
+                job.finish("cancelled", "Transcription stopped -- worker terminated")
                 return
             if rc != 0 or not (act_dir / "meta.json").exists():
                 tail = "\n".join(list(job.log)[-8:])
@@ -387,22 +404,26 @@ def adtof_thread(params: dict) -> None:
                 "key": key, "dir": str(act_dir), "fps": meta["fps"],
                 "tempo": meta["tempo"], "duration": meta["duration"],
             }
-        job.message = "peak-picking ..."
+        job.message = "Peak-picking ..."
         pick = do_pick(thresholds)
         n = sum(pick["counts"].values())
         job.progress = 1.0
-        job.finish("done", f"{n} hits picked | tempo ~{meta['tempo']:.1f} bpm")
+        job.finish("done", f"{n} hits picked -- tempo about {meta['tempo']:.1f} BPM")
     except Exception as e:  # noqa: BLE001
-        job.finish("error", f"ADTOF stage crashed: {e}")
+        job.finish("error", f"Transcription stage crashed: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
+def effective_tempo(acts: dict) -> float:
+    return float(STATE["tempo_override"] or acts["tempo"])
+
+
 def require_pick() -> tuple:
     pick, acts = STATE["pick"], STATE["acts"]
     if not pick or not acts:
-        raise HTTPException(409, "no transcription yet -- run ADTOF first")
+        raise HTTPException(409, "No transcription yet -- run Transcription first")
     return pick, acts
 
 
@@ -500,7 +521,7 @@ def build_musicxml(events: dict, tempo: float, grid: str, path: Path) -> None:
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
-app = FastAPI(title="drumlab", docs_url=None, redoc_url=None)
+app = FastAPI(title="DrumLab", version=APP_VERSION, docs_url=None, redoc_url=None)
 
 
 @app.get("/")
@@ -511,10 +532,10 @@ def index():
 @app.post("/api/upload")
 def upload(file: UploadFile = File(...)):
     if DEMUCS_JOB.status == "running" or ADTOF_JOB.status == "running":
-        raise HTTPException(409, "a job is running -- stop it before changing the input")
+        raise HTTPException(409, "A job is running -- stop it before changing the input")
     data = file.file.read()
     if not data:
-        raise HTTPException(400, "empty upload")
+        raise HTTPException(400, "Empty upload")
     sha = hashlib.sha1(data).hexdigest()[:16]
     safe_stem = re.sub(r"[^\w\-. ]+", "_", Path(file.filename or "input").stem)[:60] or "input"
     suffix = Path(file.filename or "input.bin").suffix or ".bin"
@@ -533,28 +554,39 @@ def upload(file: UploadFile = File(...)):
 
     info = sf.info(str(wav))
     duration = float(info.frames) / float(info.samplerate)
+
+    # embedded album art (attached-pic stream), if any
+    art = UPLOADS / f"{sha}_art.jpg"
+    if not art.exists():
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(orig), "-an", "-map", "0:v:0", "-frames:v", "1", str(art)],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=60,
+        )
+        if r.returncode != 0 or not art.exists() or art.stat().st_size == 0:
+            art.unlink(missing_ok=True)
+
     with STATE_LOCK:
         STATE["input"] = {
             "id": sha, "name": file.filename, "stem_name": safe_stem,
             "wav": str(wav), "duration": duration,
+            "samplerate": int(info.samplerate), "channels": int(info.channels),
+            "ext": suffix.lstrip(".").lower(), "size": len(data),
+            "art": art.exists(),
         }
         STATE["stem"] = None
         STATE["acts"] = None
         STATE["pick"] = None
-    for job in (DEMUCS_JOB, ADTOF_JOB):
-        job.status = "idle"
-        job.progress = None
-        job.message = ""
-        job.log.clear()
+        STATE["tempo_override"] = None
+    reset_jobs()
     return {"input": STATE["input"]}
 
 
 @app.post("/api/demucs/run")
 def demucs_run(params: dict):
     if not STATE["input"]:
-        raise HTTPException(409, "upload a file first")
+        raise HTTPException(409, "Upload a file first")
     if not DEMUCS_JOB.start(demucs_thread, (params,)):
-        raise HTTPException(409, "demucs already running")
+        raise HTTPException(409, "Separation is already running")
     return {"ok": True}
 
 
@@ -567,7 +599,7 @@ def demucs_stop():
 @app.post("/api/adtof/run")
 def adtof_run(params: dict):
     if not ADTOF_JOB.start(adtof_thread, (params,)):
-        raise HTTPException(409, "ADTOF already running")
+        raise HTTPException(409, "Transcription is already running")
     return {"ok": True}
 
 
@@ -577,11 +609,27 @@ def adtof_stop():
     return {"ok": True}
 
 
+@app.post("/api/tempo")
+def set_tempo(params: dict):
+    """Set or clear the manual BPM override used by exports and the score."""
+    bpm = params.get("bpm")
+    if bpm is not None:
+        try:
+            bpm = float(bpm)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Invalid BPM value")
+        if not 20 <= bpm <= 400:
+            raise HTTPException(400, "BPM must be between 20 and 400")
+    with STATE_LOCK:
+        STATE["tempo_override"] = bpm
+    return {"tempo_override": STATE["tempo_override"]}
+
+
 @app.post("/api/adtof/pick")
 def adtof_pick(params: dict):
     """Instant threshold re-pick on cached activations (no net run)."""
     if not STATE["acts"]:
-        raise HTTPException(409, "no cached activations -- run ADTOF first")
+        raise HTTPException(409, "No cached activations -- run Transcription first")
     try:
         pick = do_pick(params.get("thresholds", DEFAULT_THRESHOLDS))
     except RuntimeError as e:
@@ -594,10 +642,12 @@ def get_state():
     pick = STATE["pick"]
     return {
         "input": STATE["input"],
-        "stem": {"key": STATE["stem"]["key"]} if STATE["stem"] else None,
+        "stem": {"key": STATE["stem"]["key"],
+                 "nodrums": bool(STATE["stem"].get("nodrums"))} if STATE["stem"] else None,
         "acts": STATE["acts"],
         "pick": {"rev": pick["rev"], "thresholds": pick["thresholds"],
                  "fps": pick["fps"], "counts": pick["counts"]} if pick else None,
+        "tempo_override": STATE["tempo_override"],
         "jobs": {"demucs": DEMUCS_JOB.as_dict(), "adtof": ADTOF_JOB.as_dict()},
         "defaults": {"thresholds": DEFAULT_THRESHOLDS},
     }
@@ -607,7 +657,8 @@ def get_state():
 def get_events():
     pick, acts = require_pick()
     return {"rev": pick["rev"], "events": pick["events"],
-            "tempo": acts["tempo"], "duration": acts["duration"]}
+            "tempo": effective_tempo(acts), "detected_tempo": acts["tempo"],
+            "duration": acts["duration"]}
 
 
 @app.get("/api/audio/{which}")
@@ -616,20 +667,113 @@ def get_audio(which: str):
         return FileResponse(STATE["input"]["wav"], media_type="audio/wav")
     if which == "stem" and STATE["stem"]:
         return FileResponse(STATE["stem"]["wav"], media_type="audio/wav")
-    raise HTTPException(404, f"no {which} audio available")
+    if which == "nodrums" and STATE["stem"] and STATE["stem"].get("nodrums"):
+        return FileResponse(STATE["stem"]["nodrums"], media_type="audio/wav")
+    raise HTTPException(404, f"No {which} audio available")
+
+
+@app.get("/api/art")
+def get_art():
+    if STATE["input"] and STATE["input"].get("art"):
+        return FileResponse(UPLOADS / f"{STATE['input']['id']}_art.jpg", media_type="image/jpeg")
+    raise HTTPException(404, "No album art")
+
+
+@app.post("/api/events/update")
+def events_update(params: dict):
+    """Replace the current hit list with manually edited events (MIDI edit mode).
+
+    Edits live in the pick state, so downloads include them; the next
+    re-pick / ADTOF run overwrites them.
+    """
+    if not STATE["pick"]:
+        raise HTTPException(409, "No transcription to edit -- run Transcription first")
+    raw = params.get("events") or {}
+    events = {}
+    for cls in CH_NAMES:
+        times = raw.get(cls, [])
+        if not isinstance(times, list):
+            raise HTTPException(400, f"bad events for {cls}")
+        events[cls] = sorted(round(float(t), 5) for t in times if float(t) >= 0)
+    with STATE_LOCK:
+        PICK_REV[0] += 1
+        STATE["pick"]["rev"] = PICK_REV[0]
+        STATE["pick"]["events"] = events
+        STATE["pick"]["counts"] = {n: len(v) for n, v in events.items()}
+    return {"rev": PICK_REV[0], "counts": STATE["pick"]["counts"]}
+
+
+# stem download formats: ffmpeg args + (container extension, mimetype, name tag).
+# The name tag disambiguates formats that share a container (AAC/ALAC are both .m4a).
+STEM_FMTS = {
+    "flac": (["-c:a", "flac"], "flac", "audio/flac", ""),
+    "wav": ([], "wav", "audio/wav", ""),
+    "aac": (["-c:a", "aac", "-b:a", "256k"], "m4a", "audio/mp4", "_aac"),
+    "alac": (["-c:a", "alac"], "m4a", "audio/mp4", "_alac"),
+    "aiff": (["-c:a", "pcm_s16be"], "aiff", "audio/aiff", ""),
+    "ogg192": (["-c:a", "libvorbis", "-b:a", "192k"], "ogg", "audio/ogg", "_192"),
+    "ogg320": (["-c:a", "libvorbis", "-b:a", "320k"], "ogg", "audio/ogg", "_320"),
+}
+
+
+def stem_download(which: str, fmt: str):
+    label = "drum stem" if which == "drums" else "backing track"
+    stem = STATE["stem"]
+    if not stem:
+        raise HTTPException(409, "No separation output yet")
+    src = stem["wav"] if which == "drums" else stem.get("nodrums")
+    if not src:
+        raise HTTPException(409, f"No {label} available")
+    if fmt not in STEM_FMTS:
+        raise HTTPException(400, f"Invalid audio format -- use one of {list(STEM_FMTS)}")
+    args, ext, mime, tag = STEM_FMTS[fmt]
+    nice = out_name(f"_{which}{tag}.{ext}")
+    if fmt == "wav":
+        return FileResponse(src, media_type=mime, filename=nice)
+    cached = OUT / f"{stem['key']}_{which}_{fmt}.{ext}"
+    if not cached.exists():
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", src] + args + [str(cached)],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=600,
+        )
+        if r.returncode != 0 or not cached.exists():
+            raise HTTPException(500, "FFmpeg conversion failed: " + r.stderr.decode("utf-8", "replace")[-300:])
+    return FileResponse(cached, media_type=mime, filename=nice)
+
+
+@app.post("/api/reset")
+def reset():
+    """Full reset: session state, jobs, and all on-disk caches."""
+    DEMUCS_JOB.cancel()
+    ADTOF_JOB.cancel()
+    if DEMUCS_JOB.thread and DEMUCS_JOB.thread.is_alive():
+        DEMUCS_JOB.thread.join(timeout=5)
+    if ADTOF_JOB.thread and ADTOF_JOB.thread.is_alive():
+        ADTOF_JOB.thread.join(timeout=5)
+    with STATE_LOCK:
+        STATE["input"] = None
+        STATE["stem"] = None
+        STATE["acts"] = None
+        STATE["pick"] = None
+        STATE["tempo_override"] = None
+    ACTS_RAM.clear()
+    for d in (UPLOADS, STEMS, ACTS, OUT, DEMUCS_TMP):
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True, exist_ok=True)
+    reset_jobs()
+    return {"ok": True}
 
 
 @app.get("/api/download/{kind}")
-def download(kind: str, grid: str = "1/16"):
+def download(kind: str, grid: str = "1/16", fmt: str = "wav"):
     if grid not in GRID_Q:
-        raise HTTPException(400, f"bad grid (use one of {list(GRID_Q)})")
+        raise HTTPException(400, f"Invalid grid -- use one of {list(GRID_Q)}")
     if kind == "stem":
-        if not STATE["stem"]:
-            raise HTTPException(409, "no drum stem yet")
-        return FileResponse(STATE["stem"]["wav"], media_type="audio/wav",
-                            filename=out_name("_drums.wav"))
+        return stem_download("drums", fmt)
+    if kind == "nodrums":
+        return stem_download("no_drums", fmt)
     pick, acts = require_pick()
-    tempo = float(acts["tempo"])
+    tempo = effective_tempo(acts)
     if kind == "midi":
         path = OUT / out_name("_adtof_raw.mid")
         build_midi(pick["events"], tempo, path)
@@ -647,7 +791,7 @@ def download(kind: str, grid: str = "1/16"):
             raise HTTPException(500, f"MusicXML export failed (music21): {e}")
         return FileResponse(path, media_type="application/vnd.recordare.musicxml+xml",
                             filename=path.name)
-    raise HTTPException(404, "unknown download kind")
+    raise HTTPException(404, "Unknown download kind")
 
 
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
@@ -657,7 +801,7 @@ app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 # Launcher
 # ---------------------------------------------------------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="drumlab -- local drum transcription GUI")
+    ap = argparse.ArgumentParser(description="DrumLab -- local drum transcription GUI")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
@@ -665,7 +809,7 @@ def main() -> None:
     url = f"http://127.0.0.1:{args.port}"
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    print(f"drumlab running at {url}  (Ctrl+C to quit)")
+    print(f"DrumLab {APP_VERSION} running at {url}  (Ctrl+C to quit)")
 
     import uvicorn
 

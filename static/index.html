@@ -2,8 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>drumlab</title>
+<title>DrumLab</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%2323262e'/%3E%3Cpath d='M8 24 A 11.3 11.3 0 1 1 24 24' fill='none' stroke='%234ea1ff' stroke-width='3' stroke-linecap='round'/%3E%3Cline x1='16' y1='16' x2='22.5' y2='9.5' stroke='%23d6d9e0' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
 <script src="/static/vendor/wavesurfer.min.js"></script>
 <script src="/static/vendor/Tone.min.js"></script>
@@ -11,41 +12,64 @@
 <body>
 
 <header>
-  <h1>drumlab</h1>
+  <h1>DrumLab<span class="ver">1.0</span></h1>
   <div id="transport">
-    <button id="btn-play" title="play/pause (space)">&#9654;</button>
-    <button id="btn-rewind" title="back to start">&#9209;</button>
-    <span id="time-display">0:00.000</span>
-    <span id="tempo-display" class="hint"></span>
+    <button id="btn-play" class="t-play" title="Play / pause (space)">&#9654;</button>
+    <button id="btn-stop" class="t-stop" title="Stop and return to start"><svg width="13" height="13" viewBox="0 0 13 13"><rect width="13" height="13" rx="2" fill="currentColor"/></svg></button>
+    <span id="time-display" title="Transport position">0:00.000</span>
   </div>
-  <div id="zoom-wrap">
-    <label class="hint">zoom</label>
-    <input type="range" id="zoom" min="0" max="100" value="40">
+  <div id="meta-bar">
+    <span id="meta-display" class="hint" title="Loaded file">No file loaded</span>
+    <span id="tempo-display" title="Tempo detected by beat-tracking the transcription source"></span>
+    <span id="loop-chip" class="hidden" title="Active loop region">Loop <span id="loop-range"></span> <button id="loop-clear" title="Clear loop">&#10005;</button></span>
+  </div>
+  <div id="zoom-wrap" title="Horizontal zoom — far left fits the whole file">
+    <button id="zoom-out" class="zoom-btn" title="Zoom out">&minus;</button>
+    <input type="range" id="zoom" min="0" max="100" value="0">
+    <button id="zoom-in" class="zoom-btn" title="Zoom in">+</button>
+  </div>
+  <button id="btn-reset" class="ghost-btn" title="Reset everything to a fresh state — clears the session and all cached results">Reset</button>
+  <div id="speed-wrap" title="Playback speed — pitch preserved. Double-click to reset to 1.00×.">
+    <div id="knob-speed"></div>
+  </div>
+  <div id="master-wrap">
+    <div id="knob-master"></div>
+    <canvas id="master-meter" width="190" height="34" title="Master output level (dBFS, peak hold)"></canvas>
   </div>
 </header>
 
 <section id="controls">
 
   <div class="panel" id="panel-input">
-    <h2>input</h2>
-    <div class="row" id="entry-sel">
-      <label><input type="radio" name="entry" value="demucs" checked> Demucs <span class="hint">(full song)</span></label>
-      <label><input type="radio" name="entry" value="direct"> ADTOF-direct <span class="hint">(drum audio)</span></label>
-    </div>
-    <div id="dropzone">drop audio here<br><span class="hint">or click to browse &middot; wav / mp3 / flac / m4a</span></div>
-    <input type="file" id="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,.aiff,.opus" hidden>
-    <div id="file-name" class="hint"></div>
-    <div class="row">
-      <span class="hint">device</span>
-      <label><input type="radio" name="device" value="cuda" checked> CUDA</label>
-      <label><input type="radio" name="device" value="cpu"> CPU</label>
+    <h2>Input</h2>
+    <div class="input-flex">
+      <div id="dropzone" title="Drop an audio file here, or click to browse (wav / mp3 / flac / m4a)">
+        <span id="dz-text">Drop audio<br><span class="hint">or click &middot; wav mp3 flac m4a</span></span>
+      </div>
+      <input type="file" id="file-input" accept=".wav,.mp3,.flac,.m4a,.ogg,.aac,.aiff,.opus" hidden>
+      <div class="input-right">
+        <div class="seg" id="entry-sel">
+          <label title="The file is a full song — separate the drums first, then transcribe the stem"><input type="radio" name="entry" value="demucs" checked><span>Song</span></label>
+          <label title="The file is already isolated drum audio — skip separation and transcribe it directly"><input type="radio" name="entry" value="direct"><span>Drum stem</span></label>
+        </div>
+        <div id="file-name" class="hint">&nbsp;</div>
+        <div id="file-meta" class="hint">&nbsp;</div>
+        <div class="seg" id="device-sel" title="Compute device for both stages. CUDA uses the GPU; CPU is slower but a fallback for out-of-memory errors">
+          <label><input type="radio" name="device" value="cuda" checked><span>CUDA</span></label>
+          <label><input type="radio" name="device" value="cpu"><span>CPU</span></label>
+        </div>
+      </div>
+      <div class="sample-pad" title="Drop a one-shot audio file on a pad to use it as that drum's sound instead of the built-in synth. Click the × to revert.">
+        <div class="sample-head">Custom MIDI samples</div>
+        <div id="sample-slots"></div>
+      </div>
     </div>
   </div>
 
   <div class="panel" id="panel-demucs">
-    <h2>1 &middot; demucs <span class="chip" id="dm-status">idle</span></h2>
+    <h2>1 &middot; Separation &mdash; Demucs <span class="chip" id="dm-status">Idle</span></h2>
     <div class="row">
-      <label>model
+      <label title="Separation model. htdemucs: default hybrid transformer. htdemucs_ft: fine-tuned variant, slower but slightly cleaner. mdx_extra / mdx_extra_q: older MDX models (q = quantized, smaller).">Model
         <select id="dm-model">
           <option>htdemucs</option>
           <option>htdemucs_ft</option>
@@ -55,9 +79,9 @@
       </label>
     </div>
     <div class="row nums">
-      <label>shifts <input type="number" id="dm-shifts" min="0" max="10" step="1" value="0"></label>
-      <label>overlap <input type="number" id="dm-overlap" min="0" max="0.99" step="0.01" value="0.25"></label>
-      <label>segment <input type="number" id="dm-segment" min="1" step="1" placeholder="auto"></label>
+      <label title="Shift trick: separates N randomly time-shifted copies and averages the results. Slightly better quality, N&times; slower. 0 = off.">Shifts <input type="number" id="dm-shifts" min="0" max="10" step="1" value="0"></label>
+      <label title="Overlap between processing windows (0&ndash;0.99). Higher = smoother seams between chunks, slower. Default 0.25.">Overlap <input type="number" id="dm-overlap" min="0" max="0.99" step="0.01" value="0.25"></label>
+      <label title="Length in seconds of each chunk sent to the GPU. Lower this if you hit CUDA out-of-memory. Empty = model default (htdemucs caps at about 7 s).">Segment <input type="number" id="dm-segment" min="1" step="1" placeholder="auto"></label>
     </div>
     <div class="row">
       <button id="dm-run" class="run">Run</button>
@@ -68,26 +92,26 @@
   </div>
 
   <div class="panel" id="panel-adtof">
-    <h2>2 &middot; adtof <span class="chip" id="ad-status">idle</span></h2>
-    <div id="sliders"></div>
-    <div class="row">
-      <label>fps <input type="number" id="ad-fps" min="25" max="200" step="25" value="100"></label>
-      <label title="re-pick cached activations on every slider move (instant, no net re-run)">
-        <input type="checkbox" id="ad-live"> live-update thresholds
-      </label>
-    </div>
-    <div class="row">
-      <button id="ad-run" class="run">Run</button>
-      <button id="ad-stop" class="stop" disabled>Stop</button>
+    <h2>2 &middot; Transcription &mdash; ADTOF <span class="chip" id="ad-status">Idle</span></h2>
+    <div class="adtof-cols">
+      <div id="sliders"></div>
+      <div class="adtof-side">
+        <label title="Model frame rate (frames per second). Changes the preprocessing hop, so a new value re-runs the network. 100 is the rate the model was trained at.">FPS <input type="number" id="ad-fps" min="25" max="200" step="25" value="100"></label>
+        <label class="switch" title="Re-detect hits from the cached activation curves on every slider move. Instant — the network is not re-run.">
+          <input type="checkbox" id="ad-live"><span class="track"></span> Auto-apply
+        </label>
+        <button id="ad-run" class="run">Run</button>
+        <button id="ad-stop" class="stop" disabled>Stop</button>
+      </div>
     </div>
     <div class="progress"><div class="bar" id="ad-bar"></div></div>
     <div class="msg" id="ad-msg"></div>
   </div>
 
   <div class="panel" id="panel-out">
-    <h2>downloads</h2>
+    <h2>Export</h2>
     <div class="row">
-      <label>grid
+      <label title="Quantization grid for the quantized MIDI and the MusicXML score">Grid
         <select id="out-grid">
           <option>1/8</option>
           <option selected>1/16</option>
@@ -95,39 +119,97 @@
           <option>1/32</option>
         </select>
       </label>
+      <label title="Audio format for the stem downloads">Audio
+        <select id="out-fmt">
+          <option value="flac" selected>FLAC</option>
+          <option value="wav">WAV</option>
+          <option value="alac">ALAC (.m4a)</option>
+          <option value="aac">AAC (.m4a)</option>
+          <option value="aiff">AIFF</option>
+          <option value="ogg192">OGG 192k</option>
+          <option value="ogg320">OGG 320k</option>
+        </select>
+      </label>
+      <label title="Manual tempo for the exports and score. Leave empty to use the detected tempo.">BPM
+        <input type="number" id="out-bpm" min="20" max="400" step="0.1" placeholder="auto">
+      </label>
     </div>
     <div class="dl-list">
-      <button class="dl" id="dl-stem" disabled>drum stem .wav</button>
-      <button class="dl" id="dl-midi" disabled>MIDI &middot; unquantized (Ardour)</button>
-      <button class="dl" id="dl-midi-quant" disabled>MIDI &middot; quantized</button>
-      <button class="dl" id="dl-musicxml" disabled>MusicXML (MuseScore)</button>
+      <button class="dl" id="dl-stem" disabled title="The separated drum stem, in the selected audio format">Drum stem</button>
+      <button class="dl" id="dl-nodrums" disabled title="The rest of the mix without drums, in the selected audio format">Backing track</button>
+      <button class="dl" id="dl-midi" disabled title="Unquantized hits at their true absolute times (t=0 preserved) with the detected tempo embedded. In your DAW, set the session tempo to the detected BPM (or import the file's tempo map) so the grid matches the audio.">MIDI &mdash; performance</button>
+      <button class="dl" id="dl-midi-quant" disabled title="The same hits snapped to the selected grid at the detected tempo — for clean notation">MIDI &mdash; quantized</button>
+      <button class="dl" id="dl-musicxml" disabled title="Percussion staff built from the quantized grid. Rhythm is exact; engraving details may need touch-up in MuseScore">MusicXML</button>
+      <button class="dl" id="dl-view-score" disabled title="Render the score in a new tab (printable)">Sheet music &#8599;</button>
     </div>
-    <div class="hint">MIDI is unquantized at true absolute times (t=0 preserved) with the
-      detected tempo embedded. MusicXML is a percussion staff built from the quantized
-      grid &mdash; rhythm is exact, drum-line styling may need touch-up in MuseScore.</div>
+    <div class="hint" id="out-tempo"></div>
   </div>
 
 </section>
 
 <section id="lanes">
-  <div class="lane">
+  <div class="lane" id="lane-input">
     <div class="side">
-      <span class="lane-name">input</span>
-      <input type="range" class="gain" id="gain-input" min="0" max="1.5" step="0.01" value="0.9" title="input gain">
+      <div class="lane-head">
+        <span class="lane-name">Input</span>
+        <span class="lane-tools">
+          <button class="icon-btn ms-mute" id="mute-input" title="Mute">M</button>
+          <button class="icon-btn ms-solo" id="solo-input" title="Solo">S</button>
+        </span>
+      </div>
+      <div class="knob-slot" id="knob-input"></div>
+      <canvas class="lane-meter" id="meter-input" width="120" height="22" title="Input level (dBFS)"></canvas>
     </div>
-    <div class="body" id="wave-input"><div class="placeholder">no input loaded</div></div>
+    <div class="body" id="wave-input"><div class="placeholder">No input loaded</div></div>
   </div>
-  <div class="lane">
+  <div class="lane" id="lane-stem">
     <div class="side">
-      <span class="lane-name">stem</span>
-      <input type="range" class="gain" id="gain-stem" min="0" max="1.5" step="0.01" value="0.9" title="stem gain">
+      <div class="lane-head">
+        <span class="lane-name">Drums</span>
+        <span class="lane-tools">
+          <button class="icon-btn ms-mute" id="mute-stem" title="Mute">M</button>
+          <button class="icon-btn ms-solo" id="solo-stem" title="Solo">S</button>
+        </span>
+      </div>
+      <div class="knob-slot" id="knob-stem"></div>
+      <canvas class="lane-meter" id="meter-stem" width="120" height="22" title="Drum stem level (dBFS)"></canvas>
     </div>
-    <div class="body" id="wave-stem"><div class="placeholder">no drum stem yet</div></div>
+    <div class="body" id="wave-stem"><div class="placeholder">Run separation to hear the drum stem</div></div>
   </div>
-  <div class="lane">
+  <div class="lane" id="lane-nodrums">
     <div class="side">
-      <span class="lane-name">midi</span>
-      <input type="range" class="gain" id="gain-midi" min="0" max="1.5" step="0.01" value="0.8" title="midi synth gain">
+      <div class="lane-head">
+        <span class="lane-name">Backing</span>
+        <span class="lane-tools">
+          <button class="icon-btn ms-mute" id="mute-nodrums" title="Mute">M</button>
+          <button class="icon-btn ms-solo" id="solo-nodrums" title="Solo">S</button>
+        </span>
+      </div>
+      <div class="knob-slot" id="knob-nodrums"></div>
+      <canvas class="lane-meter" id="meter-nodrums" width="120" height="22" title="Backing level (dBFS)"></canvas>
+    </div>
+    <div class="body" id="wave-nodrums"><div class="placeholder">Run separation to hear the backing</div></div>
+  </div>
+  <div class="lane" id="lane-midi">
+    <div class="side midi-side">
+      <div class="lane-head">
+        <span class="lane-name">MIDI</span>
+        <span class="lane-tools">
+          <button class="icon-btn ms-mute" id="mute-midi" title="Mute">M</button>
+          <button class="icon-btn ms-solo" id="solo-midi" title="Solo">S</button>
+          <button class="icon-btn" id="midi-edit" title="Edit mode — click a row on the roll to add a hit there; click an existing hit to remove it. Edits are kept in the exports until the next re-detection.">&#9998;</button>
+          <button class="icon-btn" id="loop-deselect" disabled title="Clear the loop selection (drag horizontally on the roll to set one)">&#10005;</button>
+        </span>
+      </div>
+      <div class="midi-knobs">
+        <div class="knob-slot" id="knob-midi"></div>
+        <div class="knob-slot mini" id="knob-kick"></div>
+        <div class="knob-slot mini" id="knob-snare"></div>
+        <div class="knob-slot mini" id="knob-hihat"></div>
+        <div class="knob-slot mini" id="knob-tom"></div>
+        <div class="knob-slot mini" id="knob-cymbal"></div>
+      </div>
+      <canvas class="lane-meter" id="meter-midi" width="120" height="22" title="MIDI synth level (dBFS)"></canvas>
     </div>
     <div class="body" id="roll-wrap"><canvas id="roll"></canvas></div>
   </div>
