@@ -25,10 +25,10 @@ body {
   font: 13px/1.45 "Segoe UI", system-ui, sans-serif;
   display: flex;
   flex-direction: column;
+  overflow-y: auto;  /* scroll the whole page when the viewport is too short */
 }
 
 h1 { font-size: 16px; letter-spacing: 2px; margin: 0; color: var(--accent); font-weight: 700; }
-h1 .ver { font-size: 9px; font-weight: 400; letter-spacing: 0; color: var(--dim); vertical-align: super; margin-left: 3px; }
 h2 { font-size: 12px; letter-spacing: 1px; margin: 0 0 8px; color: var(--dim); text-transform: uppercase; }
 .hint { color: var(--dim); font-size: 11px; }
 .hidden { display: none !important; }
@@ -101,9 +101,14 @@ input[type=range]::-moz-range-thumb {
 
 /* ------------------------------- header ------------------------------- */
 header {
-  display: flex; align-items: center; gap: 16px;
+  display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between;
+  gap: 8px 16px;
   padding: 6px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
 }
+.hdr-left, .hdr-right {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; min-width: 0;
+}
+.hdr-left { flex: 0 1 auto; min-width: 0; }
 #transport { display: flex; align-items: center; gap: 8px; }
 #transport button {
   width: 40px; height: 32px; font-size: 14px;
@@ -115,8 +120,10 @@ button.t-stop { background: var(--stop); }
 #transport button:hover { filter: brightness(1.15); }
 #time-display { font-family: Consolas, monospace; font-size: 15px; min-width: 92px; }
 
+/* shrink (and ellipsis) but don't grow — a growing spacer would force the mix
+   group to wrap to a second line even when there's plenty of room */
 #meta-bar {
-  flex: 1; min-width: 0; display: flex; align-items: center; gap: 14px;
+  flex: 0 1 auto; min-width: 0; display: flex; align-items: center; gap: 14px;
   white-space: nowrap; overflow: hidden;
 }
 #meta-display { overflow: hidden; text-overflow: ellipsis; }
@@ -140,21 +147,28 @@ button.t-stop { background: var(--stop); }
 }
 .zoom-btn:hover { border-color: var(--accent); }
 
+.hdr-mix { display: flex; align-items: center; gap: 16px; }
 #speed-wrap { display: flex; align-items: center; }
 #master-wrap { display: flex; align-items: center; gap: 10px; }
 #master-meter { background: var(--panel2); border: 1px solid var(--line); border-radius: 3px; }
 
 /* ------------------------------- panels ------------------------------- */
+/* flex-wrap so panels reflow to new rows instead of overflowing when the window
+   is narrow / zoomed in; flex-basis sets each panel's natural width */
 #controls {
-  display: grid;
-  grid-template-columns: 1.45fr 1.15fr 1.4fr 1.0fr;
+  display: flex; flex-wrap: wrap; align-items: stretch;
   gap: 10px; padding: 10px 14px;
 }
 .panel {
   background: var(--panel); border: 1px solid var(--line);
   border-radius: 6px; padding: 10px 12px;
   display: flex; flex-direction: column;
+  flex: 1 1 300px; min-width: 0;
 }
+#panel-input { flex: 2.4 1 440px; }
+#panel-demucs { flex: 1.2 1 290px; }
+#panel-adtof { flex: 1.7 1 380px; }
+#panel-out { flex: 1 1 240px; }
 .panel > h2 { flex: none; }
 .panel.disabled { opacity: 0.45; pointer-events: none; }
 .row { display: flex; align-items: center; gap: 12px; margin: 6px 0; flex-wrap: wrap; }
@@ -197,9 +211,11 @@ button:disabled { opacity: 0.4; cursor: default; }
 .seg input:checked + span { background: var(--accent); color: #0d1117; font-weight: 600; }
 
 /* input panel: square dropzone left, params right */
-.input-flex { display: flex; gap: 12px; align-items: stretch; flex: 1; min-height: 0; }
+/* wrap so the params / samples drop to a new line instead of overlapping the
+   art when the panel is narrow; the art is a bounded responsive square */
+.input-flex { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; flex: 1; }
 #dropzone {
-  aspect-ratio: 1 / 1; height: 100%; min-height: 140px; flex: none;
+  width: clamp(130px, 18vw, 280px); aspect-ratio: 1 / 1; flex: none;
   border: 1px dashed var(--line); border-radius: 6px;
   display: flex; align-items: center; justify-content: center; text-align: center;
   cursor: pointer; font-size: 11px;
@@ -213,14 +229,14 @@ button:disabled { opacity: 0.4; cursor: default; }
   opacity: 0; transition: opacity 0.15s;
 }
 #dropzone.has-art:hover #dz-text { opacity: 1; }
-.input-right { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.input-right { display: flex; flex-direction: column; gap: 7px; min-width: 0; flex: 1 1 150px; }
 #file-name {
   color: var(--text); white-space: normal; word-break: break-all;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 
 /* custom-sample pads (right of the input params) */
-.sample-pad { flex: none; width: 150px; display: flex; flex-direction: column; gap: 4px; }
+.sample-pad { flex: 1 1 150px; min-width: 140px; display: flex; flex-direction: column; gap: 4px; }
 .sample-head { font-size: 10px; letter-spacing: 0.5px; color: var(--dim); text-transform: uppercase; }
 #sample-slots { display: flex; flex-direction: column; gap: 3px; }
 .sample-slot {
@@ -272,9 +288,15 @@ button.dl {
 button.dl:not(:disabled):hover { border-color: var(--accent); color: var(--accent); }
 
 /* ------------------------------- lanes ------------------------------- */
+/* Keep the original flex sizing — lanes take an equal share of the available
+   height. (Do NOT give #lanes a content-based basis like `flex: 1 0 auto`: that
+   makes its height depend on the waveform canvas, which feeds back through the
+   WaveSurfer height-sync and grows the lanes without bound when zoomed in.) */
 #lanes { flex: 1; display: flex; flex-direction: column; gap: 4px; padding: 4px 14px 8px; min-height: 0; }
 .lane { display: flex; gap: 8px; flex: 1; min-height: 92px; }
-#lane-midi { min-height: 168px; }
+/* MIDI side panel holds the most controls (6 knobs + meter ~191px); give it a
+   floor so they don't overflow downward into the footer when squeezed */
+#lane-midi { min-height: 200px; }
 .lane .side {
   width: 148px; flex: none; display: flex; flex-direction: column; justify-content: flex-start;
   align-items: stretch; gap: 4px;
@@ -341,6 +363,8 @@ button.dl:not(:disabled):hover { border-color: var(--accent); color: var(--accen
 footer {
   border-top: 1px solid var(--line); background: var(--panel);
   padding: 4px 14px; font-family: Consolas, monospace; font-size: 11px; color: var(--dim);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 22px;
+  min-height: 22px; display: flex; align-items: center; gap: 12px;
 }
-footer .err { color: var(--stop); }
+#log-line { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#log-line.err { color: var(--stop); }
+footer .ver { flex: none; opacity: 0.6; letter-spacing: 0.5px; }

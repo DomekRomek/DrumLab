@@ -12,29 +12,35 @@
 <body>
 
 <header>
-  <h1>DrumLab<span class="ver">1.0</span></h1>
-  <div id="transport">
-    <button id="btn-play" class="t-play" title="Play / pause (space)">&#9654;</button>
-    <button id="btn-stop" class="t-stop" title="Stop and return to start"><svg width="13" height="13" viewBox="0 0 13 13"><rect width="13" height="13" rx="2" fill="currentColor"/></svg></button>
-    <span id="time-display" title="Transport position">0:00.000</span>
+  <div class="hdr-left">
+    <h1>DrumLab</h1>
+    <div id="transport">
+      <button id="btn-play" class="t-play" title="Play / pause (space)">&#9654;</button>
+      <button id="btn-stop" class="t-stop" title="Stop and return to start"><svg width="13" height="13" viewBox="0 0 13 13"><rect width="13" height="13" rx="2" fill="currentColor"/></svg></button>
+      <span id="time-display" title="Transport position">0:00.000</span>
+    </div>
+    <div id="meta-bar">
+      <span id="meta-display" class="hint" title="Loaded file">No file loaded</span>
+      <span id="tempo-display" title="Tempo detected by beat-tracking the transcription source"></span>
+      <span id="loop-chip" class="hidden" title="Active loop region">Loop <span id="loop-range"></span> <button id="loop-clear" title="Clear loop">&#10005;</button></span>
+    </div>
   </div>
-  <div id="meta-bar">
-    <span id="meta-display" class="hint" title="Loaded file">No file loaded</span>
-    <span id="tempo-display" title="Tempo detected by beat-tracking the transcription source"></span>
-    <span id="loop-chip" class="hidden" title="Active loop region">Loop <span id="loop-range"></span> <button id="loop-clear" title="Clear loop">&#10005;</button></span>
-  </div>
-  <div id="zoom-wrap" title="Horizontal zoom — far left fits the whole file">
-    <button id="zoom-out" class="zoom-btn" title="Zoom out">&minus;</button>
-    <input type="range" id="zoom" min="0" max="100" value="0">
-    <button id="zoom-in" class="zoom-btn" title="Zoom in">+</button>
-  </div>
-  <button id="btn-reset" class="ghost-btn" title="Reset everything to a fresh state — clears the session and all cached results">Reset</button>
-  <div id="speed-wrap" title="Playback speed — pitch preserved. Double-click to reset to 1.00×.">
-    <div id="knob-speed"></div>
-  </div>
-  <div id="master-wrap">
-    <div id="knob-master"></div>
-    <canvas id="master-meter" width="190" height="34" title="Master output level (dBFS, peak hold)"></canvas>
+  <div class="hdr-right">
+    <div id="zoom-wrap" title="Horizontal zoom — far left fits the whole file">
+      <button id="zoom-out" class="zoom-btn" title="Zoom out">&minus;</button>
+      <input type="range" id="zoom" min="0" max="100" value="0">
+      <button id="zoom-in" class="zoom-btn" title="Zoom in">+</button>
+    </div>
+    <button id="btn-reset" class="ghost-btn" title="Reset everything to a fresh state — clears the session and all cached results">Reset</button>
+    <div class="hdr-mix">
+      <div id="speed-wrap" title="Playback speed — pitch preserved. Double-click to reset to 1.00×.">
+        <div id="knob-speed"></div>
+      </div>
+      <div id="master-wrap">
+        <div id="knob-master"></div>
+        <canvas id="master-meter" width="190" height="34" title="Master output level (dBFS, peak hold)"></canvas>
+      </div>
+    </div>
   </div>
 </header>
 
@@ -215,7 +221,7 @@
   </div>
 </section>
 
-<footer><span id="log-line"></span></footer>
+<footer><span id="log-line"></span><span class="ver">DrumLab 1.0</span></footer>
 
 <script src="/static/app.js"></script>
 </body>
