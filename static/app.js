@@ -393,29 +393,32 @@ function disposeLane(name) {
   $(LANE_CONT[name]).innerHTML = '<div class="placeholder">' + LANE_PLACEHOLDER[name] + "</div>";
 }
 
-// Log-compressed display peaks so quiet hits (hats) are visible instead of looking
-// like silence. Returns an interleaved [max,min,...] envelope for WaveSurfer to draw.
-function computeDisplayPeaks(toneBuffer, bins = 2400) {
+// Display peaks for WaveSurfer. One positive magnitude per bin — WaveSurfer's
+// renderer takes abs() and mirrors top/bottom, so a plain envelope is what it wants
+// (interleaving max/min makes it draw a zero-crossing comb). Resolution is matched to
+// the max zoom width so it never looks blocky. A gentle perceptual power curve lifts
+// quiet detail (hats) without turning loud masters into a solid block — a true dB
+// taper over-compresses and does exactly that.
+const DISPLAY_GAMMA = 0.65;
+function computeDisplayPeaks(toneBuffer) {
   let buf;
   try { buf = toneBuffer.get(); } catch (e) { return null; }
   if (!buf) return null;
   const ch0 = buf.getChannelData(0);
   const ch1 = buf.numberOfChannels > 1 ? buf.getChannelData(1) : null;
   const N = ch0.length;
+  const bins = Math.max(4000, Math.min(1200000, Math.round(buf.duration * 1200)));
   const per = Math.max(1, Math.floor(N / bins));
-  const out = new Float32Array(bins * 2);
-  const K = 40, denom = Math.log1p(K);
-  const comp = (x) => (x < 0 ? -1 : 1) * Math.log1p(K * Math.abs(x)) / denom;
-  for (let b = 0; b < bins; b++) {
-    let mn = 0, mx = 0;
-    const start = b * per, end = Math.min(N, start + per);
+  const count = Math.floor(N / per) || 1;
+  const out = new Float32Array(count);
+  for (let b = 0; b < count; b++) {
+    let mx = 0;
+    const start = b * per, end = start + per;
     for (let i = start; i < end; i++) {
-      const v = ch1 ? (ch0[i] + ch1[i]) * 0.5 : ch0[i];
+      const v = ch1 ? Math.max(Math.abs(ch0[i]), Math.abs(ch1[i])) : Math.abs(ch0[i]);
       if (v > mx) mx = v;
-      if (v < mn) mn = v;
     }
-    out[2 * b] = comp(mx);
-    out[2 * b + 1] = comp(mn);
+    out[b] = Math.pow(mx, DISPLAY_GAMMA);
   }
   return out;
 }
