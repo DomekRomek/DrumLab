@@ -565,16 +565,25 @@ function makeChunkScheduler(laneName) {
     return p;
   }
 
+  // stop() and dispose() in separate try blocks: Tone's stop() asserts in some
+  // states, and if it threw before dispose() the source would stay connected
+  // (and audible). dispose() must always run to disconnect the node.
+  function killSrc(s) {
+    if (!s) return;
+    try { s.stop(); } catch (e) {}
+    try { s.dispose(); } catch (e) {}
+  }
+
   function stopLive() {
     gen++;
-    for (const src of live.values()) { try { src && src.stop(); src && src.dispose(); } catch (e) {} }
+    for (const src of live.values()) killSrc(src);
     live.clear();
     activeSpeed = null;
   }
 
   function evict(speed, lo, hi) {
     for (const i of [...live.keys()]) {
-      if (i < lo) { const s = live.get(i); try { s && s.stop(); s && s.dispose(); } catch (e) {} live.delete(i); }
+      if (i < lo) { killSrc(live.get(i)); live.delete(i); }
     }
     const sp = speed.toFixed(4);
     for (const key of [...cache.keys()]) {
@@ -586,22 +595,24 @@ function makeChunkScheduler(laneName) {
     }
   }
 
-  // schedule unscheduled chunks in the window, each anchored to its transport time
+  // schedule unscheduled chunks in the window. Each chunk's start time and
+  // mid-buffer offset are computed when its buffer RESOLVES (not when it's
+  // enqueued), from the live transport position — a fetch can take ms (cached
+  // slice) to seconds (fresh atempo render), and using the enqueue-time values
+  // would start late buffers at stale times/offsets (overlap on speed-up, a
+  // behind-the-playhead cut-out on slow-down). A chunk the playhead has already
+  // passed by resolve time is dropped rather than started.
   function pump(content) {
     if (disposed || Tone.Transport.state !== "started") return;
     const speed = engine.speed;
     if (activeSpeed !== null && activeSpeed !== speed) stopLive();
     activeSpeed = speed;
     const ctx = Tone.getContext();
-    const ctxNow = ctx.currentTime;
-    const tNow = Tone.Transport.seconds;
     const cur = Math.floor(content / CHUNK_SEC);
     const hi = cur + CHUNK_AHEAD;
     const g = gen;
     for (let i = Math.max(0, cur); i <= hi; i++) {
       if (live.has(i)) continue;
-      const startT = (i * CHUNK_SEC) / speed;     // transport seconds when chunk i begins
-      const whenCtx = ctxNow + (startT - tNow);   // absolute context time → MIDI-locked
       live.set(i, null);                          // reserve the slot while fetching
       fetchChunk(speed, i).then((buf) => {
         if (disposed || g !== gen || engine.speed !== speed
@@ -609,12 +620,24 @@ function makeChunkScheduler(laneName) {
           if (live.get(i) === null) live.delete(i);
           return;
         }
-        const src = new Tone.ToneBufferSource(buf).connect(dest);
-        let when = whenCtx, offset = 0;
-        if (when <= ctx.currentTime + 0.02) {       // current/late chunk: start now, mid-buffer
-          offset = Math.max(0, (content - i * CHUNK_SEC) / speed);
-          when = ctx.currentTime + 0.02;
+        // recompute timing from the live playhead so a late buffer lands right
+        const nowCtx = ctx.currentTime;
+        const nowT = Tone.Transport.seconds;
+        const nowContentLive = speed * nowT;
+        const chunkStart = i * CHUNK_SEC;
+        if (nowContentLive >= chunkStart + CHUNK_SEC) { // window moved past it
+          live.delete(i);
+          return;
         }
+        let when, offset;
+        if (nowContentLive > chunkStart) {           // current chunk: start now, mid-buffer
+          offset = (nowContentLive - chunkStart) / speed;
+          when = nowCtx + 0.02;
+        } else {                                     // ahead chunk: anchor to its transport time
+          offset = 0;
+          when = nowCtx + (chunkStart / speed - nowT);
+        }
+        const src = new Tone.ToneBufferSource(buf).connect(dest);
         try { src.start(when, offset); live.set(i, src); }
         catch (e) { live.delete(i); try { src.dispose(); } catch (_) {} }
       }).catch(() => { if (live.get(i) === null) live.delete(i); });
@@ -693,8 +716,11 @@ async function togglePlay() {
   } else {
     let c = nowContent();
     if (engine.duration && c >= engine.duration - 0.05) { c = 0; Tone.Transport.seconds = 0; }
-    startAudio(c);
+    // Start the transport FIRST: startAudio's pump() bails unless the transport is
+    // already "started", so scheduling audio before this left the first chunks to the
+    // next ~120 ms interval tick while the MIDI began instantly (audio lagged on play).
     Tone.Transport.start();
+    startAudio(c);
   }
   renderPlayButton();
 }
@@ -713,7 +739,8 @@ function seekAll(c) {
   if (wasPlaying) { Tone.Transport.pause(); stopAudio(); }
   Tone.Transport.seconds = c / engine.speed;
   updateCursors(c);
-  if (wasPlaying) { startAudio(c); Tone.Transport.start("+0.03"); }
+  // transport before audio (see togglePlay): pump() needs state "started" to schedule
+  if (wasPlaying) { Tone.Transport.start("+0.03"); startAudio(c); }
 }
 
 // A speed change needs a one-time server render of the stretched audio (cached
@@ -1353,10 +1380,17 @@ $("ad-stop").addEventListener("click", () => { chainAdtof = null; postJSON("/api
 function dlURL(kind) {
   // "Match playback speed" time-stretches the export to the Speed knob setting
   const speed = $("out-speed").checked ? engine.speed : 1;
+  // Per-song cache-buster: without it the URL is identical across songs, so the
+  // browser serves a *previous* song's download from its HTTP cache. Include the
+  // edit revision so MIDI edits also bust. (FastAPI ignores the unknown `v` param.)
+  const id = (lastState && lastState.input && lastState.input.id) || "";
+  const key = (lastState && lastState.stem && lastState.stem.key) || "";
+  const v = encodeURIComponent([id, key, lastPickRev || ""].join("-"));
   return "/api/download/" + kind +
     "?grid=" + encodeURIComponent($("out-grid").value) +
     "&fmt=" + encodeURIComponent($("out-fmt").value) +
-    "&speed=" + speed.toFixed(4);
+    "&speed=" + speed.toFixed(4) +
+    "&v=" + v;
 }
 
 $("dl-stem").addEventListener("click", () => { window.location.href = dlURL("stem"); });

@@ -47,7 +47,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "1.6"
+APP_VERSION = "1.8"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -66,6 +66,13 @@ WORKER = APP_DIR / "adtof_worker.py"
 # [0.22, 0.24, 0.32, 0.22, 0.30] are in THIS order.
 CH_NAMES = ["kick", "snare", "tom", "hihat", "cymbal"]
 DEFAULT_THRESHOLDS = {"kick": 0.22, "snare": 0.24, "tom": 0.32, "hihat": 0.22, "cymbal": 0.30}
+# Onset-latency compensation: the model's activation peaks a few frames AFTER the
+# real transient (spectrogram framing is center=True, so i/fps is otherwise exact),
+# so every picked hit lands late against the audio. Shift all onsets earlier by this
+# many seconds. Applied once in do_pick(), so it flows to the roll, the synth, and the
+# MIDI/MusicXML exports alike. TWEAK ME by ear: raise if the synth still trails the
+# track, lower if it now anticipates; a re-pick (instant) applies the new value.
+ONSET_COMP_SEC = 0.08
 # GM percussion pitches for exported MIDI (user-requested map).
 GM_MAP = {"kick": 36, "snare": 38, "hihat": 42, "tom": 45, "cymbal": 49}
 GRID_Q = {"1/8": Fraction(1, 2), "1/16": Fraction(1, 4), "1/16T": Fraction(1, 6), "1/32": Fraction(1, 8)}
@@ -345,7 +352,9 @@ def do_pick(thresholds: dict) -> dict:
     th = [float(thresholds.get(n, DEFAULT_THRESHOLDS[n])) for n in CH_NAMES]
     picker = PP.PeakPicker(thresholds=th, fps=int(acts_info["fps"]))
     picked = picker.pick(arr, labels=list(range(5)), label_offset=0)[0]
-    events = {CH_NAMES[i]: [round(float(t), 5) for t in picked[i]] for i in range(5)}
+    # shift onsets earlier to cancel the model's activation latency (see ONSET_COMP_SEC)
+    events = {CH_NAMES[i]: [round(max(0.0, float(t) - ONSET_COMP_SEC), 5) for t in picked[i]]
+              for i in range(5)}
     with STATE_LOCK:
         PICK_REV[0] += 1
         STATE["pick"] = {
@@ -805,6 +814,11 @@ STEM_FMTS = {
 }
 
 
+# Downloads must never be served from a browser/proxy cache: the URL can repeat
+# across songs, and a stale hit hands back a *previous* song's file.
+_NO_STORE = {"Cache-Control": "no-store"}
+
+
 def stem_download(which: str, fmt: str, speed: float = 1.0):
     label = "drum stem" if which == "drums" else "backing track"
     stem = STATE["stem"]
@@ -820,7 +834,7 @@ def stem_download(which: str, fmt: str, speed: float = 1.0):
     stag = f"_{speed:g}x" if stretch else ""
     nice = out_name(f"_{which}{tag}{stag}.{ext}")
     if fmt == "wav" and not stretch:
-        return FileResponse(src, media_type=mime, filename=nice)
+        return FileResponse(src, media_type=mime, filename=nice, headers=_NO_STORE)
     cached = OUT / f"{stem['key']}_{which}_{fmt}{stag}.{ext}"
     if not cached.exists():
         # atempo time-stretches with pitch preserved; matches the Speed-knob playback
@@ -831,7 +845,7 @@ def stem_download(which: str, fmt: str, speed: float = 1.0):
         )
         if r.returncode != 0 or not cached.exists():
             raise HTTPException(500, "FFmpeg conversion failed: " + r.stderr.decode("utf-8", "replace")[-300:])
-    return FileResponse(cached, media_type=mime, filename=nice)
+    return FileResponse(cached, media_type=mime, filename=nice, headers=_NO_STORE)
 
 
 @app.post("/api/reset")
@@ -882,12 +896,12 @@ def download(kind: str, grid: str = "1/16", fmt: str = "wav", speed: float = 1.0
     if kind == "midi":
         path = OUT / out_name(f"_adtof_raw{stag}.mid")
         build_midi(events, tempo, path)
-        return FileResponse(path, media_type="audio/midi", filename=path.name)
+        return FileResponse(path, media_type="audio/midi", filename=path.name, headers=_NO_STORE)
     if kind == "midi_quant":
         gtag = grid.replace("/", "")
         path = OUT / out_name(f"_adtof_q{gtag}{stag}.mid")
         build_quant_midi(events, tempo, grid, path)
-        return FileResponse(path, media_type="audio/midi", filename=path.name)
+        return FileResponse(path, media_type="audio/midi", filename=path.name, headers=_NO_STORE)
     if kind == "musicxml":
         path = OUT / out_name(f"_adtof{stag}.musicxml")
         try:
@@ -895,7 +909,7 @@ def download(kind: str, grid: str = "1/16", fmt: str = "wav", speed: float = 1.0
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"MusicXML export failed (music21): {e}")
         return FileResponse(path, media_type="application/vnd.recordare.musicxml+xml",
-                            filename=path.name)
+                            filename=path.name, headers=_NO_STORE)
     raise HTTPException(404, "Unknown download kind")
 
 
