@@ -1531,6 +1531,7 @@ async function poll(fast) {
   try {
     const s = await api("/api/state");
     lastState = s;
+    if (s.version) $("app-ver").textContent = "DrumLab " + s.version;
     renderJob("dm", s.jobs.demucs);
     renderJob("ad", s.jobs.adtof);
     running = s.jobs.demucs.status === "running" || s.jobs.adtof.status === "running";

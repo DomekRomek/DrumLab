@@ -641,6 +641,7 @@ def adtof_pick(params: dict):
 def get_state():
     pick = STATE["pick"]
     return {
+        "version": APP_VERSION,
         "input": STATE["input"],
         "stem": {"key": STATE["stem"]["key"],
                  "nodrums": bool(STATE["stem"].get("nodrums"))} if STATE["stem"] else None,
