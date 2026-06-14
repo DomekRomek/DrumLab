@@ -155,7 +155,9 @@ function makeDbKnob(hostId, o) {
   };
   const startDb = o.startDb !== undefined ? o.startDb : 0;
   const knob = createKnob(hostId, {
-    label: o.label, size: o.size, color: o.color,
+    // pass a real default — an undefined color would override createKnob's and
+    // leave the progress arc drawn in the grey track colour (i.e. invisible)
+    label: o.label, size: o.size, color: o.color || "#4ea1ff",
     min: 0, max: 1,
     value: dbToPos(startDb),
     resetValue: dbToPos(0),
@@ -274,6 +276,8 @@ const mix = {
   midi: { gain: 1, mute: false, solo: false, node: midiBus },
 };
 
+const MIX_TRACKS = ["input", "stem", "nodrums", "midi"];
+
 function applyMix() {
   const anySolo = Object.values(mix).some((m) => m.solo);
   for (const k in mix) {
@@ -292,12 +296,17 @@ function bindMuteSolo(track) {
     applyMix();
   });
   sBtn.addEventListener("click", () => {
-    mix[track].solo = !mix[track].solo;
-    sBtn.classList.toggle("active", mix[track].solo);
+    // solo is exclusive: soloing a track clears every other solo. Clicking the
+    // already-soloed track turns solo off entirely.
+    const turningOn = !mix[track].solo;
+    for (const t of MIX_TRACKS) {
+      mix[t].solo = turningOn && t === track;
+      $("solo-" + t).classList.toggle("active", mix[t].solo);
+    }
     applyMix();
   });
 }
-for (const t of ["input", "stem", "nodrums", "midi"]) bindMuteSolo(t);
+for (const t of MIX_TRACKS) bindMuteSolo(t);
 for (const t of ["stem", "nodrums"]) $("mute-" + t).classList.add("active");
 
 const taps = {
@@ -441,7 +450,13 @@ async function loadLane(name, url) {
   // display-only, fed precomputed log-compressed peaks. One decode, no double-fetch.
   const buffer = new Tone.ToneAudioBuffer();
   await buffer.load(url);
-  const player = new Tone.GrainPlayer({ url: buffer, grainSize: 0.12, overlap: 0.08 });
+  // Granular time-stretch (pitch-preserved). The old 0.12 s grain with 0.08 s
+  // overlap meant ~67% overlap — grains piled up two-deep, which is heard as the
+  // "doubling like a reverb" when slowed, and the long 120 ms grain gave that echo
+  // an audible slap-back length. Shorter grains (80 ms) shorten the smear and a
+  // 50% overlap (0.04 s) is the equal-power crossfade point, so grains neither
+  // pile up (doubling) nor dip between (roughness). Tune by ear from here.
+  const player = new Tone.GrainPlayer({ url: buffer, grainSize: 0.08, overlap: 0.04 });
   player.playbackRate = engine.speed;
   player.connect(laneGains[name]);
 
