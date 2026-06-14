@@ -44,10 +44,10 @@ from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -670,6 +670,91 @@ def get_audio(which: str):
     if which == "nodrums" and STATE["stem"] and STATE["stem"].get("nodrums"):
         return FileResponse(STATE["stem"]["nodrums"], media_type="audio/wav")
     raise HTTPException(404, f"No {which} audio available")
+
+
+# Chunked, pitch-preserved playback streaming. The client plays audio as a window
+# of short chunks scheduled on the Web Audio clock, so RAM is bounded by the window
+# (not the song length) and stays sample-aligned with the MIDI. Speed changes reuse
+# the export's atempo: one continuous whole-file stretch (no per-chunk seams), cached,
+# then sliced on demand. Slicing a PCM WAV with input-seek is sample-accurate.
+CHUNKS = WORK / "chunks"
+CHUNKS.mkdir(parents=True, exist_ok=True)
+CHUNK_SEC = 8.0                       # content seconds per chunk (must match app.js)
+_STRETCH_GUARD = threading.Lock()
+_STRETCH_LOCKS: dict = {}             # cache path -> per-file lock (one render at a time)
+# render stretches below normal priority so they never starve demucs/adtof inference
+_LOW_PRIO = subprocess.CREATE_NO_WINDOW | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+
+
+def _lane_source(lane: str):
+    """(source wav path, stable cache key) for a playback lane, or 404/409."""
+    if lane == "input" and STATE["input"]:
+        return STATE["input"]["wav"], STATE["input"]["id"]
+    if lane == "stem" and STATE["stem"]:
+        return STATE["stem"]["wav"], STATE["stem"]["key"] + "_drums"
+    if lane == "nodrums" and STATE["stem"] and STATE["stem"].get("nodrums"):
+        return STATE["stem"]["nodrums"], STATE["stem"]["key"] + "_nodrums"
+    raise HTTPException(404, f"No {lane} audio available")
+
+
+def _evict_stretch_cache(keep_bytes: int = 1_500_000_000):
+    """LRU-cap the whole-file stretched WAVs (they are large)."""
+    files = sorted(CHUNKS.glob("*x.wav"), key=lambda p: p.stat().st_mtime)
+    total = sum(p.stat().st_size for p in files)
+    while total > keep_bytes and len(files) > 1:
+        victim = files.pop(0)
+        total -= victim.stat().st_size
+        victim.unlink(missing_ok=True)
+
+
+def _ensure_stretched(src: str, key: str, speed: float) -> Path:
+    """Path to a whole-file atempo-stretched WAV for (lane, speed), rendered once."""
+    cached = CHUNKS / f"{key}_{speed:.4f}x.wav"
+    if cached.exists():
+        os.utime(cached, None)        # mark recently used for LRU
+        return cached
+    with _STRETCH_GUARD:
+        lock = _STRETCH_LOCKS.setdefault(str(cached), threading.Lock())
+    with lock:                        # collapse concurrent first-hits into one render
+        if cached.exists():
+            return cached
+        tmp = cached.with_suffix(".tmp.wav")
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src), "-filter:a", f"atempo={speed:.4f}",
+             "-c:a", "pcm_s16le", str(tmp)],
+            capture_output=True, creationflags=_LOW_PRIO, timeout=600)
+        if r.returncode != 0 or not tmp.exists():
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(500, "Stretch failed: " + r.stderr.decode("utf-8", "replace")[-300:])
+        tmp.replace(cached)
+        _evict_stretch_cache()
+        return cached
+
+
+@app.get("/api/audio_chunk")
+def audio_chunk(lane: str, i: int, speed: float = 1.0):
+    """One playback chunk: content window [i*CHUNK_SEC, +CHUNK_SEC] at the given speed,
+    returned as a small WAV slice. speed != 1 plays a slice of the cached whole-file
+    stretch; file-time = content-time / speed (the stretch slows the timeline by speed)."""
+    speed = max(0.5, min(1.5, float(speed)))
+    src, key = _lane_source(lane)
+    if abs(speed - 1.0) > 1e-3:
+        src = str(_ensure_stretched(src, key, speed))
+    f0 = max(0.0, (i * CHUNK_SEC) / speed)
+    fdur = CHUNK_SEC / speed
+    tmp = CHUNKS / f"_slice_{os.getpid()}_{threading.get_ident()}.wav"
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{f0:.6f}", "-t", f"{fdur:.6f}", "-i", src,
+             "-c:a", "pcm_s16le", str(tmp)],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=120)
+        if r.returncode != 0 or not tmp.exists():
+            raise HTTPException(500, "Slice failed: " + r.stderr.decode("utf-8", "replace")[-300:])
+        data = tmp.read_bytes()
+    finally:
+        tmp.unlink(missing_ok=True)
+    return Response(content=data, media_type="audio/wav",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/art")
