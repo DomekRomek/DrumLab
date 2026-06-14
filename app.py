@@ -526,7 +526,10 @@ app = FastAPI(title="DrumLab", version=APP_VERSION, docs_url=None, redoc_url=Non
 
 @app.get("/")
 def index():
-    return FileResponse(APP_DIR / "static" / "index.html")
+    # inject the version so the footer is correct on first paint (the JS poll also
+    # keeps it in sync, but this makes view-source / a stale poll show the real one)
+    html = (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")
+    return Response(content=html.replace("__VER__", APP_VERSION), media_type="text/html")
 
 
 @app.post("/api/upload")
