@@ -47,7 +47,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "1.5"
+APP_VERSION = "1.6"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"

@@ -397,7 +397,7 @@ function disposeLane(name) {
   const lane = engine.lanes[name];
   if (!lane) return;
   try { lane.ws.destroy(); } catch (e) {}
-  try { lane.player.stop(); lane.player.dispose(); } catch (e) {}
+  try { lane.sched.dispose(); } catch (e) {}
   engine.lanes[name] = null;
   $(LANE_CONT[name]).innerHTML = '<div class="placeholder">' + LANE_PLACEHOLDER[name] + "</div>";
 }
@@ -446,25 +446,19 @@ async function loadLane(name, url) {
   const cont = $(LANE_CONT[name]);
   cont.innerHTML = "";
 
-  // Tone owns audio playback (GrainPlayer = pitch-preserved speed); WaveSurfer is
-  // display-only, fed precomputed log-compressed peaks. One decode, no double-fetch.
+  // Decode the whole file ONCE to compute display peaks, then free it — playback
+  // streams in chunks (bounded RAM), so we keep only the small peaks + duration.
+  // WaveSurfer is display-only, fed precomputed log-compressed peaks.
   const buffer = new Tone.ToneAudioBuffer();
   await buffer.load(url);
-  // Granular time-stretch (pitch-preserved). The old 0.12 s grain with 0.08 s
-  // overlap meant ~67% overlap — grains piled up two-deep, which is heard as the
-  // "doubling like a reverb" when slowed, and the long 120 ms grain gave that echo
-  // an audible slap-back length. Shorter grains (80 ms) shorten the smear and a
-  // 50% overlap (0.04 s) is the equal-power crossfade point, so grains neither
-  // pile up (doubling) nor dip between (roughness). Tune by ear from here.
-  const player = new Tone.GrainPlayer({ url: buffer, grainSize: 0.08, overlap: 0.04 });
-  player.playbackRate = engine.speed;
-  player.connect(laneGains[name]);
-
+  const duration = buffer.duration;
   const peaks = computeDisplayPeaks(buffer);
+  buffer.dispose();   // release the full PCM; lane.sched re-streams it as chunks
+
   const ws = WaveSurfer.create({
     container: cont,
     peaks: peaks ? [peaks] : undefined,
-    duration: buffer.duration,
+    duration: duration,
     height: Math.max(56, cont.clientHeight - 4),
     waveColor: LANE_COLORS[name].wave,
     progressColor: LANE_COLORS[name].prog,
@@ -480,11 +474,13 @@ async function loadLane(name, url) {
   ws.on("interaction", (t) => seekAll(t));
   ws.on("scroll", () => mirrorScroll(name));
   buildAmpAxis(cont);
-  engine.lanes[name] = { ws, player, height: 0 };
+  const sched = makeChunkScheduler(name);
+  engine.lanes[name] = { ws, sched, duration, height: 0 };
 
-  if (Tone.Transport.state === "started") startLanePlayer(engine.lanes[name], nowContent());
+  if (Tone.Transport.state === "started") sched.start(nowContent());
+  else sched.prefetch(engine.speed, nowContent());   // warm the playhead so play is instant
   recomputeDuration();
-  setLog(LANE_LABEL[name] + " audio loaded (" + buffer.duration.toFixed(1) + " s)");
+  setLog(LANE_LABEL[name] + " audio loaded (" + duration.toFixed(1) + " s)");
 }
 
 // dBFS reference lines through the same warp as the waveform. Even 6 dB steps so the
@@ -521,35 +517,153 @@ function buildAmpAxis(cont) {
   cont.appendChild(axis);
 }
 
-/* manual audio drive — GrainPlayers are not transport-synced so speed can differ
-   from the clock. content position C = speed * Transport.seconds. */
+/* manual audio drive — chunk schedulers are not transport-synced so speed can
+   differ from the clock. content position C = speed * Transport.seconds. */
 function laneList() {
   return LANE_NAMES.map((k) => engine.lanes[k]).filter(Boolean);
 }
 function nowContent() {
   return engine.speed * Tone.Transport.seconds;
 }
-function startLanePlayer(lane, offset) {
-  try { lane.player.stop(); } catch (e) {}
-  try {
-    lane.player.playbackRate = engine.speed;
-    if (offset < (lane.player.buffer ? lane.player.buffer.duration : Infinity)) {
-      lane.player.start(undefined, Math.max(0, offset));
+
+/* ------------------------------------------------------------------ */
+/* chunked streaming playback (bounded RAM, sample-locked to the MIDI) */
+/* ------------------------------------------------------------------ */
+// Each lane plays a sliding window of short chunks pulled from /api/audio_chunk
+// and scheduled on the Web Audio clock at their absolute transport times, so the
+// audio stays locked to the MIDI no matter when a chunk finishes decoding, and no
+// lane ever holds the whole song. Speed != 1 streams a pre-stretched copy at rate
+// 1.0 (pitch preserved server-side). CHUNK_SEC must match app.py.
+const CHUNK_SEC = 8.0;
+const CHUNK_AHEAD = 2;    // chunks scheduled ahead of the playhead
+const CHUNK_BEHIND = 1;   // chunks kept cached behind it
+const SCHED_TICK_MS = 120;
+
+function makeChunkScheduler(laneName) {
+  const dest = laneGains[laneName];
+  const cache = new Map();    // "speed:i" -> Tone.ToneAudioBuffer (decoded)
+  const pending = new Map();  // "speed:i" -> Promise
+  const live = new Map();     // i -> ToneBufferSource (null = scheduling in flight)
+  let activeSpeed = null;
+  let gen = 0;                // bumped on every (re)start/stop to void stale fetches
+  let disposed = false;
+  const k = (speed, i) => speed.toFixed(4) + ":" + i;
+
+  function fetchChunk(speed, i) {
+    const key = k(speed, i);
+    if (cache.has(key)) return Promise.resolve(cache.get(key));
+    if (pending.has(key)) return pending.get(key);
+    const p = (async () => {
+      const buf = new Tone.ToneAudioBuffer();
+      await buf.load("/api/audio_chunk?lane=" + laneName + "&i=" + i + "&speed=" + speed.toFixed(4));
+      pending.delete(key);
+      if (disposed) { buf.dispose(); throw new Error("disposed"); }
+      cache.set(key, buf);
+      return buf;
+    })();
+    pending.set(key, p);
+    return p;
+  }
+
+  function stopLive() {
+    gen++;
+    for (const src of live.values()) { try { src && src.stop(); src && src.dispose(); } catch (e) {} }
+    live.clear();
+    activeSpeed = null;
+  }
+
+  function evict(speed, lo, hi) {
+    for (const i of [...live.keys()]) {
+      if (i < lo) { const s = live.get(i); try { s && s.stop(); s && s.dispose(); } catch (e) {} live.delete(i); }
     }
-  } catch (e) {}
+    const sp = speed.toFixed(4);
+    for (const key of [...cache.keys()]) {
+      const [ksp, kidx] = key.split(":");
+      if (ksp !== sp || +kidx < lo - 1 || +kidx > hi + 1) {
+        try { cache.get(key).dispose(); } catch (e) {}
+        cache.delete(key);
+      }
+    }
+  }
+
+  // schedule unscheduled chunks in the window, each anchored to its transport time
+  function pump(content) {
+    if (disposed || Tone.Transport.state !== "started") return;
+    const speed = engine.speed;
+    if (activeSpeed !== null && activeSpeed !== speed) stopLive();
+    activeSpeed = speed;
+    const ctx = Tone.getContext();
+    const ctxNow = ctx.currentTime;
+    const tNow = Tone.Transport.seconds;
+    const cur = Math.floor(content / CHUNK_SEC);
+    const hi = cur + CHUNK_AHEAD;
+    const g = gen;
+    for (let i = Math.max(0, cur); i <= hi; i++) {
+      if (live.has(i)) continue;
+      const startT = (i * CHUNK_SEC) / speed;     // transport seconds when chunk i begins
+      const whenCtx = ctxNow + (startT - tNow);   // absolute context time → MIDI-locked
+      live.set(i, null);                          // reserve the slot while fetching
+      fetchChunk(speed, i).then((buf) => {
+        if (disposed || g !== gen || engine.speed !== speed
+            || Tone.Transport.state !== "started" || live.get(i) !== null) {
+          if (live.get(i) === null) live.delete(i);
+          return;
+        }
+        const src = new Tone.ToneBufferSource(buf).connect(dest);
+        let when = whenCtx, offset = 0;
+        if (when <= ctx.currentTime + 0.02) {       // current/late chunk: start now, mid-buffer
+          offset = Math.max(0, (content - i * CHUNK_SEC) / speed);
+          when = ctx.currentTime + 0.02;
+        }
+        try { src.start(when, offset); live.set(i, src); }
+        catch (e) { live.delete(i); try { src.dispose(); } catch (_) {} }
+      }).catch(() => { if (live.get(i) === null) live.delete(i); });
+    }
+    evict(speed, cur - CHUNK_BEHIND, hi);
+  }
+
+  return {
+    laneName,
+    fetch: fetchChunk,
+    prefetch(speed, content) {
+      const c = Math.max(0, Math.floor(content / CHUNK_SEC));
+      for (let i = c; i <= c + 1; i++) fetchChunk(speed, i).catch(() => {});
+    },
+    start(content) { stopLive(); pump(content); },
+    pump,
+    stop() { stopLive(); },
+    dispose() {
+      disposed = true; stopLive();
+      for (const b of cache.values()) { try { b.dispose(); } catch (e) {} }
+      cache.clear(); pending.clear();
+    },
+  };
 }
+
+let _schedTimer = null;
+function startScheduling() {
+  if (_schedTimer) return;
+  _schedTimer = setInterval(() => {
+    if (Tone.Transport.state !== "started") return;
+    const content = nowContent();
+    for (const lane of laneList()) lane.sched.pump(content);
+  }, SCHED_TICK_MS);
+}
+
+function startLanePlayer(lane, offset) { lane.sched.start(Math.max(0, offset)); }
 function startAudio(offset) {
-  for (const lane of laneList()) startLanePlayer(lane, offset);
+  startScheduling();
+  for (const lane of laneList()) lane.sched.start(Math.max(0, offset));
 }
 function stopAudio() {
-  for (const lane of laneList()) { try { lane.player.stop(); } catch (e) {} }
+  for (const lane of laneList()) lane.sched.stop();
 }
 
 function recomputeDuration() {
   let d = 0;
   for (const k of LANE_NAMES) {
     const lane = engine.lanes[k];
-    if (lane && lane.player.buffer) d = Math.max(d, lane.player.buffer.duration);
+    if (lane && lane.duration) d = Math.max(d, lane.duration);
   }
   if (roll.events) {
     for (const cls in roll.events) {
@@ -602,15 +716,36 @@ function seekAll(c) {
   if (wasPlaying) { startAudio(c); Tone.Transport.start("+0.03"); }
 }
 
+// A speed change needs a one-time server render of the stretched audio (cached
+// after). We debounce the knob so a sweep triggers one render, and — while playing
+// — keep the current speed audible until the new chunks are ready, then swap at the
+// live playhead so there's no silent gap.
+let _speedTimer = null, _speedTarget = null;
+function setSpeedDebounced(s) {
+  _speedTarget = s;
+  if (_speedTimer) clearTimeout(_speedTimer);
+  _speedTimer = setTimeout(() => { _speedTimer = null; setSpeed(s); }, 300);
+}
+
 function setSpeed(s) {
-  // change rate live without restarting audio: GrainPlayer rate is set in place and
-  // the clock is re-anchored so content position stays continuous.
-  const c = nowContent();
-  engine.speed = s;
-  for (const lane of laneList()) { try { lane.player.playbackRate = s; } catch (e) {} }
-  Tone.Transport.seconds = c / s;
-  rebuildPart(roll.events || {});
-  if (loop.active) { try { Tone.Transport.setLoopPoints(loop.start / s, loop.end / s); } catch (e) {} }
+  const commit = () => {
+    if (_speedTarget !== s) return;   // superseded by a newer target
+    const c = nowContent();
+    engine.speed = s;
+    Tone.Transport.seconds = c / s;
+    rebuildPart(roll.events || {});
+    if (loop.active) { try { Tone.Transport.setLoopPoints(loop.start / s, loop.end / s); } catch (e) {} }
+    updateCursors(c);
+    if (Tone.Transport.state === "started") { stopAudio(); startAudio(c); }
+    else for (const lane of laneList()) lane.sched.prefetch(s, c);
+  };
+  if (Math.abs(s - engine.speed) < 1e-4) return;
+  if (Tone.Transport.state === "started" && laneList().length) {
+    // pre-render the stretched audio at the playhead before swapping (no gap)
+    const cur = Math.max(0, Math.floor(nowContent() / CHUNK_SEC));
+    if (s !== 1.0) setLog("Rendering " + s.toFixed(2) + "× audio …");
+    Promise.all(laneList().map((l) => l.sched.fetch(s, cur))).then(commit).catch(commit);
+  } else commit();
 }
 
 function updateCursors(t) {
@@ -1292,7 +1427,7 @@ knobs.speed = createKnob("knob-speed", {
   label: "Speed", size: 36, min: 0.5, max: 1.5, value: 1.0, resetValue: 1.0,
   color: "#4ea1ff",
   fmt: (v) => v.toFixed(2) + "×",
-  onChange: setSpeed,
+  onChange: setSpeedDebounced,
 });
 
 /* ------------------------------------------------------------------ */
