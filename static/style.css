@@ -313,19 +313,21 @@ button.dl:not(:disabled):hover { border-color: var(--accent); color: var(--accen
    height. (Do NOT give #lanes a content-based basis like `flex: 1 0 auto`: that
    makes its height depend on the waveform canvas, which feeds back through the
    WaveSurfer height-sync and grows the lanes without bound when zoomed in.) */
-/* Floor matches the lanes' own min-heights (3*140 + 212 + gaps + padding ≈ 656):
+/* Floor matches the lanes' own min-heights (3*144 + 224 + gaps + padding ≈ 680):
    when the viewport is too short, #lanes keeps this height so the whole page
    scrolls (body has overflow-y:auto) instead of collapsing and letting the lanes
    overlap the footer. It's a fixed px floor on purpose — a content-based basis
    (min-content / flex:1 0 auto) would pull in the waveform canvas height and
    feed back through the WaveSurfer height-sync. */
-#lanes { flex: 1; display: flex; flex-direction: column; gap: 4px; padding: 4px 14px 8px; min-height: 656px; }
-/* min-height must clear the side-panel contents (head + 60px knob + meter +
-   padding ≈ 138px) so the controls never overlap when the lane is squeezed */
-.lane { display: flex; gap: 8px; flex: 1; min-height: 140px; }
-/* MIDI side panel holds the most controls (6 knobs + meter); give it a taller
-   floor so they don't overflow downward into the footer when squeezed */
-#lane-midi { min-height: 212px; }
+#lanes { flex: 1; display: flex; flex-direction: column; gap: 4px; padding: 4px 14px 8px; min-height: 680px; }
+/* min-height must clear the side-panel contents (measured 138px: head + 60px
+   knob + meter + padding) so the controls never overlap when the lane is
+   squeezed */
+.lane { display: flex; gap: 8px; flex: 1; min-height: 144px; }
+/* MIDI side packs the most: its lane-head wraps 4 tool buttons onto two rows
+   (~51px) on top of the 6-knob grid + meter, measured at 215px of content. Give
+   it a taller floor so the dBFS meter doesn't clip out the bottom when squeezed. */
+#lane-midi { min-height: 224px; }
 .lane .side {
   width: 148px; flex: none; display: flex; flex-direction: column; justify-content: flex-start;
   align-items: stretch; gap: 4px;
