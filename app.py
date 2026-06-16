@@ -1,22 +1,6 @@
 r"""DRUMLAB -- local drum-transcription control GUI
 ==================================================
 
-Wraps the Demucs -> ADTOF pipeline in a hands-on local web UI:
-manual Run/Stop per stage, cached activations with instant threshold
-re-picking, four time-aligned lanes (input / drums / backing / MIDI roll),
-and Ardour-ready MIDI + quantized MIDI + MusicXML downloads.
-
-INSTALL (inside the existing venv -- do NOT let pip touch torch):
-    C:\Users\dom\Documents\_Drumming\Stem-Music\venv\Scripts\python.exe -m pip install -r requirements-extra.txt
-  The extra deps (fastapi, uvicorn, python-multipart, music21) are pure-CPU
-  and do not depend on torch. NEVER run pip with -U/--upgrade here, and never
-  install anything that lists torch/torchaudio as a dependency without
-  --no-deps. torch must stay at 2.12.0+cu130.
-
-RUN:
-    C:\Users\dom\Documents\_Drumming\Stem-Music\venv\Scripts\python.exe app.py
-  Starts uvicorn on 127.0.0.1 and opens your default browser.
-  Options: --port 8765   --no-browser
 
 LAYOUT OF workdir/ (created next to this file, safe to delete to clear caches):
     uploads/   converted-to-WAV inputs (keyed by content hash)
@@ -47,7 +31,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "3.0"
+APP_VERSION = "3.2"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -177,6 +161,10 @@ def reset_jobs() -> None:
         job.cancelled = False
 
 STATE_LOCK = threading.Lock()
+# Single global workspace, NOT per-client. DrumLab is a single-user tool, so every
+# connected browser (second tab, or a phone when bound with --host 0.0.0.0) shares this
+# one STATE -- loading a song anywhere replaces it everywhere. Intentional; making it
+# per-session would mean keying this dict + uploads + caches by a cookie. See README.
 STATE = {
     "input": None,  # {"id", "name", "stem_name", "wav", "duration"}
     "stems": None,  # {"key", "dir", "sources": [present source names]}
@@ -998,20 +986,46 @@ app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 # ---------------------------------------------------------------------------
 # Launcher
 # ---------------------------------------------------------------------------
+def preload_models() -> int:
+    """Download every Demucs model the UI offers, so the first separation doesn't stall
+    on a weight download. ADTOF's weights ship inside the adtof_pytorch package, so there's
+    nothing to fetch on that side."""
+    models = ["htdemucs", "htdemucs_ft", "mdx_extra", "mdx_extra_q"]
+    code = (
+        "import sys\n"
+        "from demucs.pretrained import get_model\n"
+        "for m in sys.argv[1:]:\n"
+        "    print('  fetching ' + m + ' ...', flush=True)\n"
+        "    get_model(m)\n"
+        "print('Demucs models ready.')\n"
+    )
+    print(f"Preloading {len(models)} Demucs models (downloads to the demucs cache) ...")
+    return subprocess.run([PYEXE, "-c", code, *models]).returncode
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="DrumLab -- local drum transcription GUI")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="Address to bind (default 127.0.0.1; 0.0.0.0 exposes it on your LAN)")
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--preload", action="store_true",
+                    help="Download all Demucs models, then exit")
     args = ap.parse_args()
 
-    url = f"http://127.0.0.1:{args.port}"
+    if args.preload:
+        sys.exit(preload_models())
+
+    url = f"http://{args.host}:{args.port}"
+    # 0.0.0.0/:: are bind-only wildcards; open a loopback URL in the browser instead.
+    browser_url = f"http://127.0.0.1:{args.port}" if args.host in ("0.0.0.0", "::") else url
     if not args.no_browser:
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        threading.Timer(1.0, lambda: webbrowser.open(browser_url)).start()
     print(f"DrumLab {APP_VERSION} running at {url}  (Ctrl+C to quit)")
 
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":
