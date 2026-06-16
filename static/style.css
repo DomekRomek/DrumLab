@@ -26,6 +26,9 @@ body {
   display: flex;
   flex-direction: column;
   overflow-y: auto;  /* scroll the whole page when the viewport is too short */
+  /* footer clearance is reserved by #lanes::after, not padding here: the bottom lanes
+     OVERFLOW #lanes and an overflowing flex item escapes any padding-bottom on the body
+     or on #lanes, so the fixed footer would still cover the last lane. */
 }
 
 h1 { font-size: 16px; letter-spacing: 2px; margin: 0; color: var(--accent); font-weight: 700; }
@@ -93,6 +96,15 @@ input[type=range]::-moz-range-thumb {
 .icon-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .icon-btn.active { background: var(--accent); border-color: var(--accent); color: #0d1117; }
 .icon-btn:disabled { opacity: 0.35; cursor: default; }
+/* download-select buttons draw their square in CSS (no font glyph, so it renders
+   identically across browsers/OSes); currentColor rides the idle/hover/active
+   colours — grey outline → blue on hover → dark box on the accent fill */
+.icon-btn.ms-dl { display: inline-flex; align-items: center; justify-content: center; }
+.icon-btn.ms-dl::before {
+  content: ""; width: 7px; height: 7px;
+  border: 1.5px solid currentColor; border-radius: 3px; background: transparent;
+}
+.icon-btn.ms-dl.active::before { background: currentColor; }   /* fill when selected */
 .ghost-btn {
   padding: 4px 14px; border-radius: 4px; cursor: pointer; font-size: 12px;
   background: var(--panel2); color: var(--dim); border: 1px solid var(--line);
@@ -183,10 +195,10 @@ button.t-stop { background: var(--stop); }
 .eye-btn .slash { display: none; }
 .eye-btn.off { color: var(--accent); }
 .eye-btn.off .slash { display: inline; }
-.panel.collapsed { opacity: 0.55; align-self: flex-start; }
-.panel.collapsed > :not(.panel-head) { display: none; }
-.panel.collapsed .panel-head { margin-bottom: 0; }
-.panel.collapsed .eye-btn { opacity: 1; }   /* keep the toggle usable */
+/* a hidden stage greys out in place (its tracks are hidden in the lane area) —
+   it does NOT collapse, which looked broken next to the full-height panels */
+.panel.stage-off { opacity: 0.5; }
+.panel.stage-off .panel-head, .panel.stage-off .eye-btn { opacity: 1; }
 .row { display: flex; align-items: center; gap: 12px; margin: 6px 0; flex-wrap: wrap; }
 .row label { display: inline-flex; align-items: center; gap: 5px; }
 .row.nums input[type=number] { width: 62px; }
@@ -230,6 +242,23 @@ button:disabled { opacity: 0.4; cursor: default; }
 }
 .seg label:last-child span { border-right: none; }
 .seg input:checked + span { background: var(--accent); color: #0d1117; font-weight: 600; }
+
+/* "split off" source picker — themed toggle pills, multi-select */
+.split-sel { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.split-label { font-size: 12px; color: var(--dim); margin-right: 2px; }
+.split-pill {
+  background: var(--panel2); color: var(--dim); border: 1px solid var(--line);
+  border-radius: 999px; padding: 4px 11px; font-size: 12px; cursor: pointer;
+}
+.split-pill:hover { border-color: var(--accent); color: var(--text); }
+.split-pill.on { background: var(--accent); border-color: var(--accent); color: #0d1117; font-weight: 600; }
+.split-pill:disabled { opacity: 0.35; cursor: default; }
+.split-pill:disabled:hover { border-color: var(--line); color: var(--dim); }
+/* the Backing pill is the remainder, not a source — set it off with a divider */
+.split-div { width: 1px; align-self: stretch; background: var(--line); margin: 2px 3px; }
+/* ...and give it its own orange so it reads as distinct from the source pills */
+#split-backing:hover:not(:disabled) { border-color: #e8843a; color: var(--text); }
+#split-backing.on { background: #e8843a; border-color: #e8843a; color: #0d1117; }
 
 /* input panel: square dropzone left, params right */
 /* wrap so the params / samples drop to a new line instead of overlapping the
@@ -306,7 +335,9 @@ button.dl {
   border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; cursor: pointer;
   font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+button.dl:disabled { cursor: default; }
 button.dl:not(:disabled):hover { border-color: var(--accent); color: var(--accent); }
+button.dl.dl-wide { grid-column: 1 / -1; }
 
 /* ------------------------------- lanes ------------------------------- */
 /* Keep the original flex sizing — lanes take an equal share of the available
@@ -320,26 +351,42 @@ button.dl:not(:disabled):hover { border-color: var(--accent); color: var(--accen
    (min-content / flex:1 0 auto) would pull in the waveform canvas height and
    feed back through the WaveSurfer height-sync. */
 #lanes { flex: 1; display: flex; flex-direction: column; gap: 4px; padding: 4px 14px 8px; min-height: 680px; }
-/* min-height must clear the side-panel contents (measured 138px: head + 60px
-   knob + meter + padding) so the controls never overlap when the lane is
-   squeezed */
-.lane { display: flex; gap: 8px; flex: 1; min-height: 144px; }
-/* MIDI side packs the most: its lane-head wraps 4 tool buttons onto two rows
-   (~51px) on top of the 6-knob grid + meter, measured at 215px of content. Give
-   it a taller floor so the dBFS meter doesn't clip out the bottom when squeezed. */
+/* Reserve a strip for the fixed footer at the TRUE bottom of the lane stack. The lanes
+   are flex items that overflow #lanes whenever their min-heights exceed the floor above
+   (the default Input+Drums+Backing+MIDI ≈ 752px already does), and an overflowing flex
+   item escapes a padding-bottom on #lanes or the body — so the footer would cover the
+   last lane. A generated flex item sits *after* the last lane in that same overflow, so
+   its box is the lowest thing in the scroll region and the footer lands on it, not on
+   the MIDI lane. Height must be ≥ the footer's box height (~25px). */
+#lanes::after { content: ""; flex: 0 0 32px; }
+/* min-height must clear the side-panel contents so the gain knob never overlaps
+   the tool buttons above it or the meter below when many lanes squeeze each lane
+   to its floor: padding(12) + gaps(8) + head(~44) + knob-slot(78) + meter(22). */
+.lane { display: flex; gap: 8px; flex: 1; min-height: 168px; }
+/* MIDI side packs the most: lane-head (name + one tool row) on top of the 6-knob
+   grid + meter. Give it a taller floor so the dBFS meter doesn't clip out the
+   bottom when squeezed. */
 #lane-midi { min-height: 224px; }
 .lane .side {
   width: 148px; flex: none; display: flex; flex-direction: column; justify-content: flex-start;
   align-items: stretch; gap: 4px;
   background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
 }
-.lane-head { display: flex; align-items: flex-start; justify-content: space-between; flex: none; }
+/* name on top, the M/S/select/remove buttons in one row beneath it — a 2x2 grid
+   pushed the knob down and clipped its "Gain" label when a lane had four tools */
+.lane-head { display: flex; flex-direction: column; align-items: stretch; gap: 4px; flex: none; }
 .lane-name { font-size: 12px; font-weight: 600; letter-spacing: 0.5px; color: var(--dim); }
-.lane-tools { display: flex; gap: 3px; flex-wrap: wrap; justify-content: flex-end; max-width: 56px; }
+.lane-tools { display: flex; gap: 3px; }
 .lane .knob-slot { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
+/* the gain knob + its label live in a padded slot that can't be crushed below
+   their own size (60px dial + 10px label) — flex:1 lets it grow, the min-height
+   floor stops it collapsing onto the buttons/meter when the lane is squeezed */
+.lane .side > .knob-slot { min-height: 78px; padding: 4px 0; box-sizing: border-box; }
 .lane .lane-meter { flex: none; margin-top: auto; }
 .icon-btn.ms-mute.active { background: var(--stop); border-color: var(--stop); color: #fff; }
 .icon-btn.ms-solo.active { background: var(--pause); border-color: var(--pause); color: #0d1117; }
+.icon-btn.ms-dl.active { background: var(--accent); border-color: var(--accent); color: #0d1117; }
+.icon-btn.ms-x:hover:not(:disabled) { border-color: var(--stop); color: var(--stop); }
 .lane-meter { width: 100%; height: 22px; background: var(--panel2); border-radius: 3px; }
 .lane .body {
   flex: 1; min-width: 0; position: relative;
@@ -392,6 +439,11 @@ button.dl:not(:disabled):hover { border-color: var(--accent); color: var(--accen
 .knob .knob-label { font-size: 9px; color: var(--dim); line-height: 1.1; white-space: nowrap; font-family: Consolas, monospace; }
 
 footer {
+  /* Pinned to the viewport bottom (the way sites pin nav/cookie bars): position:fixed
+     keys off the viewport, not whichever element is scrolling, so it stays put no
+     matter how the page scrolls. Body has a matching padding-bottom so it never covers
+     content. Opaque bg covers content scrolling behind it. */
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
   border-top: 1px solid var(--line); background: var(--panel);
   padding: 4px 14px; font-family: Consolas, monospace; font-size: 11px; color: var(--dim);
   min-height: 22px; display: flex; align-items: center; gap: 12px;

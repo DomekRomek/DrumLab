@@ -37,19 +37,34 @@ const ROLL_LABEL = { kick: "Kick", snare: "Snare", hihat: "Hi-hat", tom: "Tom", 
 // hidden per-instrument trim: evens out raw synth loudness so the user-facing
 // knobs all sit at 0 dB (snare carries the groove; metals are tamed hard)
 const CLASS_TRIM = { kick: 0.9, snare: 1.0, hihat: 0.22, tom: 0.9, cymbal: 0.22 };
-const LANE_NAMES = ["input", "stem", "nodrums"];
-const LANE_CONT = { input: "wave-input", stem: "wave-stem", nodrums: "wave-nodrums" };
-const LANE_LABEL = { input: "Input", stem: "Drum stem", nodrums: "Backing" };
+// Demucs full-separation sources (display/lane order) + the derived backing. The
+// backend writes the same four stems; names match, so order here is UI-only.
+const SOURCES = ["drums", "bass", "vocals", "other"];
+const STEM_LANES = [...SOURCES, "backing"];        // separation-driven lanes
+const LANE_NAMES = ["input", ...STEM_LANES];       // all audio lanes (no MIDI)
+const LANE_CONT = Object.fromEntries(LANE_NAMES.map((k) => [k, "wave-" + k]));
+const LANE_LABEL = {
+  input: "Input", drums: "Drums", bass: "Bass", other: "Other",
+  vocals: "Vocals", backing: "Backing",
+};
 const LANE_PLACEHOLDER = {
   input: "No input loaded",
-  stem: "Run separation to hear the drum stem",
-  nodrums: "Run separation to hear the backing",
+  drums: "Run separation to hear the drums",
+  bass: "Run separation to hear the bass",
+  other: "Run separation to hear the other parts",
+  vocals: "Run separation to hear the vocals",
+  backing: "Everything you don't split off, summed together",
 };
 const LANE_COLORS = {
   input:   { wave: "#4a6f96", prog: "#76a8d8" },
-  stem:    { wave: "#4f8f6a", prog: "#7cc79b" },
-  nodrums: { wave: "#8a7a4d", prog: "#c4ad6e" },
+  drums:   { wave: "#4f8f6a", prog: "#7cc79b" },
+  bass:    { wave: "#9c5fb0", prog: "#c184d6" },
+  other:   { wave: "#5a7fb5", prog: "#85a8da" },
+  vocals:  { wave: "#b5694a", prog: "#dd9576" },
+  backing: { wave: "#8a7a4d", prog: "#c4ad6e" },
 };
+// every scrollable lane body (waveforms + the MIDI roll) — for scroll/zoom/resize sync
+const LANE_BODIES = LANE_NAMES.map((k) => LANE_CONT[k]).concat("roll-wrap");
 const STATUS_LABEL = { idle: "Idle", running: "Running…", done: "Complete", cancelled: "Stopped", error: "Error" };
 
 /* ------------------------------------------------------------------ */
@@ -247,7 +262,7 @@ function makeTap(node) {
 /* ------------------------------------------------------------------ */
 const engine = {
   started: false,
-  lanes: { input: null, stem: null, nodrums: null },  // {ws, player, height}
+  lanes: Object.fromEntries(LANE_NAMES.map((k) => [k, null])),  // {ws, sched, height}
   part: null,
   synths: null,
   duration: 0,
@@ -258,25 +273,21 @@ const engine = {
 
 const master = new Tone.Gain(1.0);
 master.connect(Tone.getDestination());
-const laneGains = {
-  input: new Tone.Gain(1.0).connect(master),
-  stem: new Tone.Gain(0).connect(master),     // applyMix() sets these (drums/backing start muted)
-  nodrums: new Tone.Gain(0).connect(master),
-};
+const laneGains = {};
+for (const k of LANE_NAMES) laneGains[k] = new Tone.Gain(0).connect(master);
+laneGains.input.gain.value = 1.0;            // applyMix() takes over once it runs
 const midiBus = new Tone.Gain(1.0).connect(master);
 const classGains = {};
 for (const c of CLASSES) classGains[c.id] = new Tone.Gain(CLASS_TRIM[c.id]).connect(midiBus);
 
 // track mixer state; node gain = knob gain, gated by mute/solo.
-// drums/backing sit at 0 dB but start muted — unmute to hear them.
-const mix = {
-  input: { gain: 1, mute: false, solo: false, node: laneGains.input },
-  stem: { gain: 1, mute: true, solo: false, node: laneGains.stem },
-  nodrums: { gain: 1, mute: true, solo: false, node: laneGains.nodrums },
-  midi: { gain: 1, mute: false, solo: false, node: midiBus },
-};
+// the separated stems sit at 0 dB but start muted — unmute to hear them.
+const mix = { midi: { gain: 1, mute: false, solo: false, node: midiBus } };
+for (const k of LANE_NAMES) {
+  mix[k] = { gain: 1, mute: k !== "input", solo: false, node: laneGains[k] };
+}
 
-const MIX_TRACKS = ["input", "stem", "nodrums", "midi"];
+const MIX_TRACKS = [...LANE_NAMES, "midi"];
 
 function applyMix() {
   const anySolo = Object.values(mix).some((m) => m.solo);
@@ -307,15 +318,10 @@ function bindMuteSolo(track) {
   });
 }
 for (const t of MIX_TRACKS) bindMuteSolo(t);
-for (const t of ["stem", "nodrums"]) $("mute-" + t).classList.add("active");
+for (const t of STEM_LANES) $("mute-" + t).classList.add("active");  // stems start muted
 
-const taps = {
-  master: makeTap(master),
-  input: makeTap(laneGains.input),
-  stem: makeTap(laneGains.stem),
-  nodrums: makeTap(laneGains.nodrums),
-  midi: makeTap(midiBus),
-};
+const taps = { master: makeTap(master), midi: makeTap(midiBus) };
+for (const k of LANE_NAMES) taps[k] = makeTap(laneGains[k]);
 
 /* ------------------------------------------------------------------ */
 /* drum synths (+ optional user-loaded one-shot samples per instrument) */
@@ -441,7 +447,11 @@ function computeDisplayPeaks(toneBuffer) {
   return out;
 }
 
-async function loadLane(name, url) {
+// per-lane load token: the latest loadLane() for a lane wins; any earlier call
+// still in flight self-destructs on completion instead of leaking a ws/scheduler.
+const _laneToken = {};
+async function loadLane(name, url, chunkQuery) {
+  const token = (_laneToken[name] = {});
   disposeLane(name);
   const cont = $(LANE_CONT[name]);
   cont.innerHTML = "";
@@ -474,7 +484,12 @@ async function loadLane(name, url) {
   ws.on("interaction", (t) => seekAll(t));
   ws.on("scroll", () => mirrorScroll(name));
   buildAmpAxis(cont);
-  const sched = makeChunkScheduler(name);
+  const sched = makeChunkScheduler(name, chunkQuery);
+  if (_laneToken[name] !== token) {   // a newer load superseded this one
+    try { ws.destroy(); } catch (e) {}
+    try { sched.dispose(); } catch (e) {}
+    return;
+  }
   engine.lanes[name] = { ws, sched, duration, height: 0 };
 
   if (Tone.Transport.state === "started") sched.start(nowContent());
@@ -539,8 +554,9 @@ const CHUNK_AHEAD = 2;    // chunks scheduled ahead of the playhead
 const CHUNK_BEHIND = 1;   // chunks kept cached behind it
 const SCHED_TICK_MS = 120;
 
-function makeChunkScheduler(laneName) {
+function makeChunkScheduler(laneName, chunkQuery) {
   const dest = laneGains[laneName];
+  const extraQ = chunkQuery || "";
   const cache = new Map();    // "speed:i" -> Tone.ToneAudioBuffer (decoded)
   const pending = new Map();  // "speed:i" -> Promise
   const live = new Map();     // i -> ToneBufferSource (null = scheduling in flight)
@@ -555,7 +571,7 @@ function makeChunkScheduler(laneName) {
     if (pending.has(key)) return pending.get(key);
     const p = (async () => {
       const buf = new Tone.ToneAudioBuffer();
-      await buf.load("/api/audio_chunk?lane=" + laneName + "&i=" + i + "&speed=" + speed.toFixed(4));
+      await buf.load("/api/audio_chunk?lane=" + laneName + "&i=" + i + "&speed=" + speed.toFixed(4) + extraQ);
       pending.delete(key);
       if (disposed) { buf.dispose(); throw new Error("disposed"); }
       cache.set(key, buf);
@@ -846,7 +862,7 @@ function ensureOverlay(bodyEl) {
 
 function updateLoopOverlays() {
   const region = loop.preview || (loop.active ? [loop.start, loop.end] : null);
-  const bodies = [$("wave-input"), $("wave-stem"), $("wave-nodrums"), $("roll-wrap")];
+  const bodies = LANE_BODIES.map((id) => $(id));
   for (const body of bodies) {
     const ov = ensureOverlay(body);
     if (!region) { ov.style.display = "none"; continue; }
@@ -944,10 +960,10 @@ function syncLaneHeights() {
 }
 
 const laneRO = new ResizeObserver(() => requestAnimationFrame(syncLaneHeights));
-for (const id of ["wave-input", "wave-stem", "wave-nodrums", "roll-wrap"]) laneRO.observe($(id));
+for (const id of LANE_BODIES) laneRO.observe($(id));
 
 /* wheel scrubs all lanes left/right */
-for (const id of ["wave-input", "wave-stem", "wave-nodrums", "roll-wrap"]) {
+for (const id of LANE_BODIES) {
   $(id).addEventListener("wheel", (e) => {
     e.preventDefault();
     const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
@@ -1236,19 +1252,127 @@ async function runPick() {
 /* ------------------------------------------------------------------ */
 function getDevice() { return document.querySelector('input[name="device"]:checked').value; }
 
-/* per-stage show/hide via the eye toggles: collapse the panel + hide its tracks */
-function bindStageEye(eyeId, panelId, laneIds) {
-  const eye = $(eyeId);
-  let hidden = false;
-  eye.addEventListener("click", () => {
-    hidden = !hidden;
-    eye.classList.toggle("off", hidden);
-    $(panelId).classList.toggle("collapsed", hidden);
-    for (const id of laneIds) $(id).classList.toggle("hidden", hidden);
+/* ------------------------------------------------------------------ */
+/* separation selection: which sources to split off, which to download */
+/* ------------------------------------------------------------------ */
+// splitSel: sources that get their own lane (the rest sum into Backing).
+const splitSel = { drums: true, bass: false, vocals: false, other: false };
+// showBacking: user's intent to keep the Backing track (toggled via its pill / × ).
+let showBacking = true;
+// dlSel: audio lanes ticked for "Download selected" (the □ button on each lane) —
+// the stems, Backing, and the raw Input (e.g. grab the original at a changed speed).
+const dlSel = {};
+for (const k of LANE_NAMES) dlSel[k] = false;
+const stageHidden = { dm: false, ad: false };
+
+// sources present on disk (all four, until a separation tells us otherwise)
+function presentSources() {
+  return (lastState && lastState.stems) ? lastState.stems.sources : SOURCES;
+}
+function backingParts() { return presentSources().filter((s) => !splitSel[s]); }
+// Backing only makes sense as its own track when it's a proper, non-empty subset:
+// all sources split off -> empty; nothing split off -> identical to the input.
+function backingMakesSense() {
+  const off = presentSources().filter((s) => splitSel[s]).length;
+  return off >= 1 && backingParts().length >= 1;
+}
+
+function laneVisible(name) {
+  if (name === "backing") return !stageHidden.dm && showBacking && backingMakesSense();
+  if (SOURCES.includes(name)) return !stageHidden.dm && splitSel[name];
+  return true;
+}
+
+function loadStemLane(name, url, q) {
+  loadLane(name, url, q)
+    .catch((e) => setLog("Waveform failed: " + e.message, true))
+    .finally(() => { if (!laneVisible(name) && engine.lanes[name]) disposeLane(name); });  // untoggled mid-load
+}
+
+function renderStemLanes() {
+  const stems = lastState && lastState.stems;
+  const avail = presentSources();
+  for (const s of SOURCES) {
+    $("lane-" + s).classList.toggle("hidden", !laneVisible(s));
+    if (splitSel[s] && stems && avail.includes(s) && !engine.lanes[s]) {
+      loadStemLane(s, "/api/audio/" + s + "?v=" + stems.key);
+    } else if (!splitSel[s] && engine.lanes[s]) {
+      disposeLane(s);
+    }
+  }
+  // backing = the unsplit sources, summed on the server (keyed by composition)
+  $("lane-backing").classList.toggle("hidden", !laneVisible("backing"));
+  const sig = backingParts().join(",");
+  if (stems && showBacking && backingMakesSense()) {
+    if (engine._backingSig !== sig) {
+      engine._backingSig = sig;
+      const q = "&parts=" + encodeURIComponent(sig);
+      loadStemLane("backing", "/api/audio/backing?v=" + stems.key + "_" + encodeURIComponent(sig) + q, q);
+    }
+  } else if (engine.lanes.backing) {
+    engine._backingSig = null;
+    disposeLane("backing");
+  }
+  syncSplitPills();
+  updateDlSelected();
+}
+
+// keep the Split-off pills (incl. Backing) in step with the selection state
+function syncSplitPills() {
+  for (const pill of document.querySelectorAll("#dm-split .split-pill[data-src]")) {
+    pill.classList.toggle("on", !!splitSel[pill.dataset.src]);
+  }
+  const bk = $("split-backing");
+  const sensible = backingMakesSense();
+  bk.disabled = !sensible;
+  bk.classList.toggle("on", sensible && showBacking);
+}
+
+function updateDlSelected() {
+  for (const k of LANE_NAMES) {
+    const btn = $("dlsel-" + k);
+    if (btn) btn.classList.toggle("active", !!dlSel[k]);
+  }
+  $("dl-selected").disabled = selectedStems().length === 0;
+}
+
+// split-off pills (one per source) + the Backing toggle pill
+for (const pill of document.querySelectorAll("#dm-split .split-pill[data-src]")) {
+  pill.addEventListener("click", () => {
+    splitSel[pill.dataset.src] = !splitSel[pill.dataset.src];
+    renderStemLanes();
   });
 }
-bindStageEye("dm-eye", "panel-demucs", ["lane-stem", "lane-nodrums"]);
-bindStageEye("ad-eye", "panel-adtof", ["lane-midi"]);
+$("split-backing").addEventListener("click", () => {
+  if (!backingMakesSense()) return;
+  showBacking = !showBacking;
+  renderStemLanes();
+});
+
+// per-lane download-select (□) and remove (×) buttons
+for (const k of LANE_NAMES) {
+  $("dlsel-" + k).addEventListener("click", () => { dlSel[k] = !dlSel[k]; updateDlSelected(); });
+  const rm = $("rm-" + k);
+  if (rm) rm.addEventListener("click", () => {
+    if (k === "backing") showBacking = false;   // Backing's × just hides the track
+    else splitSel[k] = false;                    // a source's × folds it back into Backing
+    renderStemLanes();
+  });
+}
+
+// per-stage eye toggles: grey the panel out in place + hide its tracks
+$("dm-eye").addEventListener("click", () => {
+  stageHidden.dm = !stageHidden.dm;
+  $("dm-eye").classList.toggle("off", stageHidden.dm);
+  $("panel-demucs").classList.toggle("stage-off", stageHidden.dm);
+  renderStemLanes();
+});
+$("ad-eye").addEventListener("click", () => {
+  stageHidden.ad = !stageHidden.ad;
+  $("ad-eye").classList.toggle("off", stageHidden.ad);
+  $("panel-adtof").classList.toggle("stage-off", stageHidden.ad);
+  $("lane-midi").classList.toggle("hidden", stageHidden.ad);
+});
 
 function fmtSize(bytes) {
   if (bytes >= 1 << 20) return (bytes / (1 << 20)).toFixed(1) + " MB";
@@ -1358,7 +1482,7 @@ $("ad-run").addEventListener("click", async () => {
 // From stem: transcribe the Demucs drum stem — run separation first if there isn't one
 $("ad-run-stem").addEventListener("click", async () => {
   const params = adtofParams("stem");
-  if (!(lastState && lastState.stem)) {
+  if (!(lastState && lastState.stems)) {
     try {
       await postJSON("/api/demucs/run", demucsParams());
       chainAdtof = params;
@@ -1384,7 +1508,7 @@ function dlURL(kind) {
   // browser serves a *previous* song's download from its HTTP cache. Include the
   // edit revision so MIDI edits also bust. (FastAPI ignores the unknown `v` param.)
   const id = (lastState && lastState.input && lastState.input.id) || "";
-  const key = (lastState && lastState.stem && lastState.stem.key) || "";
+  const key = (lastState && lastState.stems && lastState.stems.key) || "";
   const v = encodeURIComponent([id, key, lastPickRev || ""].join("-"));
   return "/api/download/" + kind +
     "?grid=" + encodeURIComponent($("out-grid").value) +
@@ -1393,8 +1517,34 @@ function dlURL(kind) {
     "&v=" + v;
 }
 
-$("dl-stem").addEventListener("click", () => { window.location.href = dlURL("stem"); });
-$("dl-nodrums").addEventListener("click", () => { window.location.href = dlURL("nodrums"); });
+// a lane is downloadable once its audio exists: Input as soon as it's loaded, the
+// stems + Backing only after separation has run.
+function laneDownloadable(k) {
+  if (!laneVisible(k)) return false;
+  return k === "input" ? !!(lastState && lastState.input)
+                       : !!(lastState && lastState.stems);
+}
+// the audio lanes currently ticked for download (only ones that actually exist)
+function selectedStems() {
+  return LANE_NAMES.filter((k) => dlSel[k] && laneDownloadable(k));
+}
+function dlStemsURL() {
+  const speed = $("out-speed").checked ? engine.speed : 1;
+  // key the cache-buster off the stems when present, else the input id, so an
+  // Input-only download still varies per song (see [[drumlab-download-cachebust]]).
+  const key = (lastState && lastState.stems && lastState.stems.key)
+           || (lastState && lastState.input && lastState.input.id) || "";
+  const v = encodeURIComponent([key, selectedStems().join("+")].join("-"));
+  let url = "/api/download_stems?stems=" + encodeURIComponent(selectedStems().join(",")) +
+    "&fmt=" + encodeURIComponent($("out-fmt").value) +
+    "&speed=" + speed.toFixed(4) + "&v=" + v;
+  if (selectedStems().includes("backing")) url += "&backing=" + encodeURIComponent(backingParts().join(","));
+  return url;
+}
+$("dl-selected").addEventListener("click", () => {
+  if (!selectedStems().length) return;
+  window.location.href = dlStemsURL();
+});
 $("dl-midi").addEventListener("click", () => { window.location.href = dlURL("midi"); });
 $("dl-midi-quant").addEventListener("click", () => { window.location.href = dlURL("midi_quant"); });
 $("dl-musicxml").addEventListener("click", () => { window.location.href = dlURL("musicxml"); });
@@ -1430,23 +1580,17 @@ const knobs = {
     label: "Master", size: 36, maxDb: 20,
     onGain: (g) => { master.gain.value = g; },
   }),
-  input: makeDbKnob("knob-input", {
-    label: "Gain", size: 60, maxDb: 6,
-    onGain: (g) => { mix.input.gain = g; applyMix(); },
-  }),
-  stem: makeDbKnob("knob-stem", {
-    label: "Gain", size: 60, maxDb: 6,
-    onGain: (g) => { mix.stem.gain = g; applyMix(); },
-  }),
-  nodrums: makeDbKnob("knob-nodrums", {
-    label: "Gain", size: 60, maxDb: 6,
-    onGain: (g) => { mix.nodrums.gain = g; applyMix(); },
-  }),
   midi: makeDbKnob("knob-midi", {
     label: "Gain", size: 40, maxDb: 6,
     onGain: (g) => { mix.midi.gain = g; applyMix(); },
   }),
 };
+for (const k of LANE_NAMES) {
+  knobs[k] = makeDbKnob("knob-" + k, {
+    label: "Gain", size: 60, maxDb: 6,
+    onGain: (g) => { mix[k].gain = g; applyMix(); },
+  });
+}
 const KNOB_LABEL = { kick: "Kick", snare: "Snare", hihat: "Hat", tom: "Tom", cymbal: "Cymbal" };
 for (const c of CLASSES) {
   knobs[c.id] = makeDbKnob("knob-" + c.id, {
@@ -1576,8 +1720,8 @@ async function poll(fast) {
       lastPickRev = 0;
       roll.events = null;
       if (engine.part) { try { engine.part.dispose(); } catch (e) {} engine.part = null; }
-      disposeLane("stem");
-      disposeLane("nodrums");
+      for (const k of STEM_LANES) disposeLane(k);
+      engine._backingSig = null;
       clearLoop();
       renderInputMeta(s.input);
       updateCounts();
@@ -1587,13 +1731,16 @@ async function poll(fast) {
       $("zoom").value = 0;  // fit the whole new file
       seekAll(0);
       loadLane("input", "/api/audio/input?v=" + s.input.id).catch((e) => setLog("Waveform failed: " + e.message, true));
+      renderStemLanes();  // reset stem lanes to placeholders for the current selection
     }
-    if (s.stem && s.stem.key !== lastStemKey) {
-      lastStemKey = s.stem.key;
-      loadLane("stem", "/api/audio/stem?v=" + s.stem.key).catch((e) => setLog("Waveform failed: " + e.message, true));
-      if (s.stem.nodrums) {
-        loadLane("nodrums", "/api/audio/nodrums?v=" + s.stem.key).catch((e) => setLog("Waveform failed: " + e.message, true));
-      }
+    if (s.stems && s.stems.key !== lastStemKey) {
+      lastStemKey = s.stems.key;
+      for (const k of STEM_LANES) disposeLane(k);   // fresh separation -> reload per selection
+      engine._backingSig = null;
+      renderStemLanes();
+    } else if (!s.stems && lastStemKey) {
+      lastStemKey = null;
+      renderStemLanes();
     }
     if (s.pick && s.pick.rev !== lastPickRev) {
       lastPickRev = s.pick.rev;
@@ -1610,7 +1757,7 @@ async function poll(fast) {
     // chained run: separation finished -> start transcription
     if (chainAdtof) {
       const dm = s.jobs.demucs.status;
-      if (dm === "done" && s.stem && s.jobs.adtof.status !== "running") {
+      if (dm === "done" && s.stems && s.jobs.adtof.status !== "running") {
         const p = chainAdtof;
         chainAdtof = null;
         postJSON("/api/adtof/run", p).then(() => poll(true)).catch((e) => setLog("Transcription: " + e.message, true));
@@ -1619,8 +1766,7 @@ async function poll(fast) {
       }
     }
 
-    $("dl-stem").disabled = !s.stem;
-    $("dl-nodrums").disabled = !(s.stem && s.stem.nodrums);
+    updateDlSelected();
     const havePick = !!s.pick;
     $("dl-midi").disabled = !havePick;
     $("dl-midi-quant").disabled = !havePick;
@@ -1668,6 +1814,7 @@ buildSliders();
 buildSampleSlots();
 engine.synths = makeSynths();
 applyMix();
+renderStemLanes();   // show placeholder lanes for the default selection
 applyZoom();
 poll(true);
 requestAnimationFrame(raf);

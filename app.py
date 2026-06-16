@@ -47,7 +47,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "2.0"
+APP_VERSION = "3.0"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -64,6 +64,8 @@ WORKER = APP_DIR / "adtof_worker.py"
 # Model output channel order (ADTOF LABELS_5 = [35, 38, 47, 42, 49]).
 # NOTE: channel 2 is TOM and channel 3 is HI-HAT -- the package defaults
 # [0.22, 0.24, 0.32, 0.22, 0.30] are in THIS order.
+# Demucs full-separation sources (htdemucs / mdx all emit these four).
+SOURCES = ["drums", "bass", "other", "vocals"]
 CH_NAMES = ["kick", "snare", "tom", "hihat", "cymbal"]
 DEFAULT_THRESHOLDS = {"kick": 0.22, "snare": 0.24, "tom": 0.32, "hihat": 0.22, "cymbal": 0.30}
 # Onset-latency compensation: the model's activation peaks a few frames AFTER the
@@ -177,7 +179,7 @@ def reset_jobs() -> None:
 STATE_LOCK = threading.Lock()
 STATE = {
     "input": None,  # {"id", "name", "stem_name", "wav", "duration"}
-    "stem": None,   # {"key", "wav", "nodrums"}
+    "stems": None,  # {"key", "dir", "sources": [present source names]}
     "acts": None,   # {"key", "dir", "fps", "tempo", "duration"}
     "pick": None,   # {"rev", "thresholds", "fps", "events", "counts"}
     "tempo_override": None,  # manual BPM; None = use the detected tempo
@@ -267,15 +269,17 @@ def demucs_thread(params: dict) -> None:
         device = params["device"]
         seg_tag = f"_seg{segment}" if segment else ""
         key = f"{inp['id']}_{model}_sh{shifts}_ov{overlap:g}{seg_tag}"
-        stem_path = STEMS / key / "drums.wav"
+        out_dir = STEMS / key
 
-        if stem_path.exists():
-            nodrums_cached = stem_path.parent / "no_drums.wav"
+        def present_sources() -> list:
+            return [s for s in SOURCES if (out_dir / f"{s}.wav").exists()]
+
+        cached = present_sources()
+        if cached:
             with STATE_LOCK:
-                STATE["stem"] = {"key": key, "wav": str(stem_path),
-                                 "nodrums": str(nodrums_cached) if nodrums_cached.exists() else None}
+                STATE["stems"] = {"key": key, "dir": str(out_dir), "sources": cached}
             job.progress = 1.0
-            job.finish("done", "Reused cached stem (same input and parameters)")
+            job.finish("done", "Reused cached stems (same input and parameters)")
             return
 
         tmp = DEMUCS_TMP / key
@@ -283,8 +287,11 @@ def demucs_thread(params: dict) -> None:
             shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True, exist_ok=True)
 
+        # Full separation (all four sources) so the UI can split off any of them and
+        # sum the rest into a backing track on demand. Demucs computes all sources
+        # internally regardless, so this is no slower than --two-stems.
         cmd = [
-            PYEXE, "-m", "demucs", "--two-stems", "drums", "-n", model,
+            PYEXE, "-m", "demucs", "-n", model,
             "--shifts", str(shifts), "--overlap", str(overlap),
             "-d", device, "-o", str(tmp),
         ]
@@ -304,22 +311,21 @@ def demucs_thread(params: dict) -> None:
             job.finish("error", classify_error(tail))
             return
 
-        found = next(tmp.rglob("drums.wav"), None)
-        if found is None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        moved = []
+        for s in SOURCES:
+            found = next(tmp.rglob(f"{s}.wav"), None)
+            if found is not None:
+                shutil.move(str(found), str(out_dir / f"{s}.wav"))
+                moved.append(s)
+        shutil.rmtree(tmp, ignore_errors=True)
+        if "drums" not in moved:
             job.finish("error", "Separation finished but produced no drum stem")
             return
-        stem_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(found), str(stem_path))
-        found_nd = next(tmp.rglob("no_drums.wav"), None)
-        nodrums_path = stem_path.parent / "no_drums.wav"
-        if found_nd is not None:
-            shutil.move(str(found_nd), str(nodrums_path))
-        shutil.rmtree(tmp, ignore_errors=True)
         with STATE_LOCK:
-            STATE["stem"] = {"key": key, "wav": str(stem_path),
-                             "nodrums": str(nodrums_path) if nodrums_path.exists() else None}
+            STATE["stems"] = {"key": key, "dir": str(out_dir), "sources": moved}
         job.progress = 1.0
-        job.finish("done", "Drum stem ready")
+        job.finish("done", "Stems ready (" + ", ".join(moved) + ")")
     except Exception as e:  # noqa: BLE001
         job.finish("error", f"Separation stage crashed: {e}")
 
@@ -376,10 +382,10 @@ def adtof_thread(params: dict) -> None:
         device = params.get("device", "cuda")
 
         if source == "stem":
-            if not STATE["stem"]:
+            if not STATE["stems"]:
                 job.finish("error", "No drum stem yet -- run Separation first, or set the source to 'Drum stem'")
                 return
-            wav = Path(STATE["stem"]["wav"])
+            wav = Path(STATE["stems"]["dir"]) / "drums.wav"
         else:
             if not STATE["input"]:
                 job.finish("error", "No input file uploaded")
@@ -585,7 +591,7 @@ def upload(file: UploadFile = File(...)):
             "ext": suffix.lstrip(".").lower(), "size": len(data),
             "art": art.exists(),
         }
-        STATE["stem"] = None
+        STATE["stems"] = None
         STATE["acts"] = None
         STATE["pick"] = None
         STATE["tempo_override"] = None
@@ -655,8 +661,8 @@ def get_state():
     return {
         "version": APP_VERSION,
         "input": STATE["input"],
-        "stem": {"key": STATE["stem"]["key"],
-                 "nodrums": bool(STATE["stem"].get("nodrums"))} if STATE["stem"] else None,
+        "stems": {"key": STATE["stems"]["key"], "sources": STATE["stems"]["sources"]}
+                 if STATE["stems"] else None,
         "acts": STATE["acts"],
         "pick": {"rev": pick["rev"], "thresholds": pick["thresholds"],
                  "fps": pick["fps"], "counts": pick["counts"]} if pick else None,
@@ -674,14 +680,56 @@ def get_events():
             "duration": acts["duration"]}
 
 
+def _parse_parts(parts: Optional[str]) -> list:
+    """Validated, de-duped, sorted backing composition from a 'a,b,c' query."""
+    if not parts:
+        return []
+    out = [p for p in dict.fromkeys(parts.split(",")) if p in SOURCES]
+    return sorted(out)
+
+
+def _ensure_backing(parts: list) -> tuple:
+    """Sum the given source stems into one WAV (cached per composition).
+
+    Returns (path, cache key). The summed mix never exceeds the original (the four
+    stems add back to it), so straight summation with no normalisation is safe."""
+    stems = STATE["stems"]
+    if not stems:
+        raise HTTPException(409, "No separation output yet")
+    parts = [p for p in parts if p in stems["sources"]]
+    if not parts:
+        raise HTTPException(409, "Backing track is empty (every source is split off)")
+    out_dir = Path(stems["dir"])
+    sig = "-".join(parts)
+    bkey = stems["key"] + "_backing_" + sig
+    cached = out_dir / f"_backing_{sig}.wav"
+    if cached.exists():
+        return cached, bkey
+    inputs = []
+    for p in parts:
+        inputs += ["-i", str(out_dir / f"{p}.wav")]
+    if len(parts) == 1:
+        shutil.copyfile(out_dir / f"{parts[0]}.wav", cached)
+        return cached, bkey
+    filt = f"amix=inputs={len(parts)}:normalize=0"
+    r = subprocess.run(
+        ["ffmpeg", "-y"] + inputs + ["-filter_complex", filt, "-c:a", "pcm_s16le", str(cached)],
+        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=600)
+    if r.returncode != 0 or not cached.exists():
+        cached.unlink(missing_ok=True)
+        raise HTTPException(500, "Backing mix failed: " + r.stderr.decode("utf-8", "replace")[-300:])
+    return cached, bkey
+
+
 @app.get("/api/audio/{which}")
-def get_audio(which: str):
+def get_audio(which: str, parts: Optional[str] = None):
     if which == "input" and STATE["input"]:
         return FileResponse(STATE["input"]["wav"], media_type="audio/wav")
-    if which == "stem" and STATE["stem"]:
-        return FileResponse(STATE["stem"]["wav"], media_type="audio/wav")
-    if which == "nodrums" and STATE["stem"] and STATE["stem"].get("nodrums"):
-        return FileResponse(STATE["stem"]["nodrums"], media_type="audio/wav")
+    if which == "backing":
+        path, _ = _ensure_backing(_parse_parts(parts))
+        return FileResponse(str(path), media_type="audio/wav", headers={"Cache-Control": "no-store"})
+    if which in SOURCES and STATE["stems"] and which in STATE["stems"]["sources"]:
+        return FileResponse(str(Path(STATE["stems"]["dir"]) / f"{which}.wav"), media_type="audio/wav")
     raise HTTPException(404, f"No {which} audio available")
 
 
@@ -699,14 +747,15 @@ _STRETCH_LOCKS: dict = {}             # cache path -> per-file lock (one render 
 _LOW_PRIO = subprocess.CREATE_NO_WINDOW | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
 
 
-def _lane_source(lane: str):
+def _lane_source(lane: str, parts: Optional[str] = None):
     """(source wav path, stable cache key) for a playback lane, or 404/409."""
     if lane == "input" and STATE["input"]:
         return STATE["input"]["wav"], STATE["input"]["id"]
-    if lane == "stem" and STATE["stem"]:
-        return STATE["stem"]["wav"], STATE["stem"]["key"] + "_drums"
-    if lane == "nodrums" and STATE["stem"] and STATE["stem"].get("nodrums"):
-        return STATE["stem"]["nodrums"], STATE["stem"]["key"] + "_nodrums"
+    if lane == "backing":
+        path, bkey = _ensure_backing(_parse_parts(parts))
+        return str(path), bkey
+    if lane in SOURCES and STATE["stems"] and lane in STATE["stems"]["sources"]:
+        return str(Path(STATE["stems"]["dir"]) / f"{lane}.wav"), STATE["stems"]["key"] + "_" + lane
     raise HTTPException(404, f"No {lane} audio available")
 
 
@@ -745,12 +794,12 @@ def _ensure_stretched(src: str, key: str, speed: float) -> Path:
 
 
 @app.get("/api/audio_chunk")
-def audio_chunk(lane: str, i: int, speed: float = 1.0):
+def audio_chunk(lane: str, i: int, speed: float = 1.0, parts: Optional[str] = None):
     """One playback chunk: content window [i*CHUNK_SEC, +CHUNK_SEC] at the given speed,
     returned as a small WAV slice. speed != 1 plays a slice of the cached whole-file
     stretch; file-time = content-time / speed (the stretch slows the timeline by speed)."""
     speed = max(0.5, min(1.5, float(speed)))
-    src, key = _lane_source(lane)
+    src, key = _lane_source(lane, parts)
     if abs(speed - 1.0) > 1e-3:
         src = str(_ensure_stretched(src, key, speed))
     f0 = max(0.0, (i * CHUNK_SEC) / speed)
@@ -819,23 +868,31 @@ STEM_FMTS = {
 _NO_STORE = {"Cache-Control": "no-store"}
 
 
-def stem_download(which: str, fmt: str, speed: float = 1.0):
-    label = "drum stem" if which == "drums" else "backing track"
-    stem = STATE["stem"]
-    if not stem:
-        raise HTTPException(409, "No separation output yet")
-    src = stem["wav"] if which == "drums" else stem.get("nodrums")
-    if not src:
-        raise HTTPException(409, f"No {label} available")
+def _render_stem(which: str, fmt: str, speed: float, parts: Optional[str]) -> tuple:
+    """Render one stem ('input'/'drums'/'bass'/'other'/'vocals' or 'backing') to the
+    chosen format and speed. Returns (path, download filename, mimetype)."""
     if fmt not in STEM_FMTS:
         raise HTTPException(400, f"Invalid audio format -- use one of {list(STEM_FMTS)}")
+    if which == "input":
+        if not STATE["input"]:
+            raise HTTPException(409, "No input loaded")
+        src = str(STATE["input"]["wav"])
+        skey = STATE["input"]["id"]
+    elif which == "backing":
+        src, skey = _ensure_backing(_parse_parts(parts))
+        src = str(src)
+    elif which in SOURCES and STATE["stems"] and which in STATE["stems"]["sources"]:
+        src = str(Path(STATE["stems"]["dir"]) / f"{which}.wav")
+        skey = STATE["stems"]["key"] + "_" + which
+    else:
+        raise HTTPException(409, f"No {which} stem available")
     args, ext, mime, tag = STEM_FMTS[fmt]
     stretch = abs(speed - 1.0) > 1e-3
     stag = f"_{speed:g}x" if stretch else ""
     nice = out_name(f"_{which}{tag}{stag}.{ext}")
     if fmt == "wav" and not stretch:
-        return FileResponse(src, media_type=mime, filename=nice, headers=_NO_STORE)
-    cached = OUT / f"{stem['key']}_{which}_{fmt}{stag}.{ext}"
+        return Path(src), nice, mime
+    cached = OUT / f"{skey}_{fmt}{stag}.{ext}"
     if not cached.exists():
         # atempo time-stretches with pitch preserved; matches the Speed-knob playback
         filt = ["-filter:a", f"atempo={speed:.4f}"] if stretch else []
@@ -845,7 +902,33 @@ def stem_download(which: str, fmt: str, speed: float = 1.0):
         )
         if r.returncode != 0 or not cached.exists():
             raise HTTPException(500, "FFmpeg conversion failed: " + r.stderr.decode("utf-8", "replace")[-300:])
-    return FileResponse(cached, media_type=mime, filename=nice, headers=_NO_STORE)
+    return cached, nice, mime
+
+
+@app.get("/api/download_stems")
+def download_stems(stems: str, fmt: str = "flac", speed: float = 1.0, backing: Optional[str] = None):
+    """Download the selected stems. One stem -> that file; several -> a single ZIP.
+
+    `stems` is a comma-separated list of source names and/or 'backing'/'input';
+    `backing` gives the backing composition (the sources summed into it)."""
+    speed = max(0.5, min(2.0, float(speed)))
+    wanted = [s for s in dict.fromkeys((stems or "").split(",")) if s in SOURCES or s in ("backing", "input")]
+    if not wanted:
+        raise HTTPException(400, "No stems selected")
+    rendered = [_render_stem(w, fmt, speed, backing) for w in wanted]
+    if len(rendered) == 1:
+        path, nice, mime = rendered[0]
+        return FileResponse(str(path), media_type=mime, filename=nice, headers=_NO_STORE)
+    import zipfile
+
+    stretch = abs(speed - 1.0) > 1e-3
+    ztag = f"_{speed:g}x" if stretch else ""
+    zpath = OUT / out_name(f"_stems{ztag}.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as zf:
+        for path, nice, _mime in rendered:
+            zf.write(str(path), arcname=nice)
+    return FileResponse(str(zpath), media_type="application/zip",
+                        filename=zpath.name, headers=_NO_STORE)
 
 
 @app.post("/api/reset")
@@ -859,7 +942,7 @@ def reset():
         ADTOF_JOB.thread.join(timeout=5)
     with STATE_LOCK:
         STATE["input"] = None
-        STATE["stem"] = None
+        STATE["stems"] = None
         STATE["acts"] = None
         STATE["pick"] = None
         STATE["tempo_override"] = None
@@ -876,10 +959,6 @@ def download(kind: str, grid: str = "1/16", fmt: str = "wav", speed: float = 1.0
     if grid not in GRID_Q:
         raise HTTPException(400, f"Invalid grid -- use one of {list(GRID_Q)}")
     speed = max(0.5, min(2.0, float(speed)))  # atempo's single-pass range
-    if kind == "stem":
-        return stem_download("drums", fmt, speed)
-    if kind == "nodrums":
-        return stem_download("no_drums", fmt, speed)
     pick, acts = require_pick()
     tempo = effective_tempo(acts)
     # "Match playback speed": stretch event times by 1/speed and the embedded tempo by
