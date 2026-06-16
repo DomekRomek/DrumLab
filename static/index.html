@@ -93,8 +93,10 @@
         <span class="split-label">Split off</span>
         <button type="button" class="split-pill on" data-src="drums">Drums</button>
         <button type="button" class="split-pill" data-src="bass">Bass</button>
-        <button type="button" class="split-pill" data-src="other">Other</button>
         <button type="button" class="split-pill" data-src="vocals">Vocals</button>
+        <button type="button" class="split-pill" data-src="other">Other</button>
+        <span class="split-div"></span>
+        <button type="button" class="split-pill on" id="split-backing" title="Show the Backing track (everything you don't split off, summed). Greyed out when it would be empty (all sources split off) or identical to the input (nothing split off).">Backing</button>
       </div>
     </div>
     <div class="row nums">
@@ -128,7 +130,7 @@
           <input type="checkbox" id="ad-live"><span class="track"></span> Auto-apply
         </label>
         <button id="ad-run" class="run" title="Transcribe the input audio directly (ADTOF works best on the raw mix)">Run</button>
-        <button id="ad-run-stem" class="run alt" title="Transcribe the Demucs drum stem instead. Runs separation first if needed.">From stem &#8631;</button>
+        <button id="ad-run-stem" class="run alt" title="Transcribe the Demucs drum stem instead. Runs separation first if needed.">From drums &#8631;</button>
         <button id="ad-stop" class="stop" disabled>Stop</button>
       </div>
     </div>
@@ -201,7 +203,7 @@
         <span class="lane-tools">
           <button class="icon-btn ms-mute" id="mute-drums" title="Mute">M</button>
           <button class="icon-btn ms-solo" id="solo-drums" title="Solo">S</button>
-          <button class="icon-btn ms-dl" id="dlsel-drums" title="Select for download">&#10515;</button>
+          <button class="icon-btn ms-dl" id="dlsel-drums" title="Select for download">&#10003;</button>
           <button class="icon-btn ms-x" id="rm-drums" title="Remove this track (unticks it under Split off)">&#10005;</button>
         </span>
       </div>
@@ -217,7 +219,7 @@
         <span class="lane-tools">
           <button class="icon-btn ms-mute" id="mute-bass" title="Mute">M</button>
           <button class="icon-btn ms-solo" id="solo-bass" title="Solo">S</button>
-          <button class="icon-btn ms-dl" id="dlsel-bass" title="Select for download">&#10515;</button>
+          <button class="icon-btn ms-dl" id="dlsel-bass" title="Select for download">&#10003;</button>
           <button class="icon-btn ms-x" id="rm-bass" title="Remove this track (unticks it under Split off)">&#10005;</button>
         </span>
       </div>
@@ -226,22 +228,6 @@
     </div>
     <div class="body" id="wave-bass"><div class="placeholder">Run separation to hear the bass</div></div>
   </div>
-  <div class="lane hidden" id="lane-other">
-    <div class="side">
-      <div class="lane-head">
-        <span class="lane-name">Other</span>
-        <span class="lane-tools">
-          <button class="icon-btn ms-mute" id="mute-other" title="Mute">M</button>
-          <button class="icon-btn ms-solo" id="solo-other" title="Solo">S</button>
-          <button class="icon-btn ms-dl" id="dlsel-other" title="Select for download">&#10515;</button>
-          <button class="icon-btn ms-x" id="rm-other" title="Remove this track (unticks it under Split off)">&#10005;</button>
-        </span>
-      </div>
-      <div class="knob-slot" id="knob-other"></div>
-      <canvas class="lane-meter" id="meter-other" width="120" height="22" title="Other level (dBFS)"></canvas>
-    </div>
-    <div class="body" id="wave-other"><div class="placeholder">Run separation to hear the other parts</div></div>
-  </div>
   <div class="lane hidden" id="lane-vocals">
     <div class="side">
       <div class="lane-head">
@@ -249,7 +235,7 @@
         <span class="lane-tools">
           <button class="icon-btn ms-mute" id="mute-vocals" title="Mute">M</button>
           <button class="icon-btn ms-solo" id="solo-vocals" title="Solo">S</button>
-          <button class="icon-btn ms-dl" id="dlsel-vocals" title="Select for download">&#10515;</button>
+          <button class="icon-btn ms-dl" id="dlsel-vocals" title="Select for download">&#10003;</button>
           <button class="icon-btn ms-x" id="rm-vocals" title="Remove this track (unticks it under Split off)">&#10005;</button>
         </span>
       </div>
@@ -258,6 +244,22 @@
     </div>
     <div class="body" id="wave-vocals"><div class="placeholder">Run separation to hear the vocals</div></div>
   </div>
+  <div class="lane hidden" id="lane-other">
+    <div class="side">
+      <div class="lane-head">
+        <span class="lane-name">Other</span>
+        <span class="lane-tools">
+          <button class="icon-btn ms-mute" id="mute-other" title="Mute">M</button>
+          <button class="icon-btn ms-solo" id="solo-other" title="Solo">S</button>
+          <button class="icon-btn ms-dl" id="dlsel-other" title="Select for download">&#10003;</button>
+          <button class="icon-btn ms-x" id="rm-other" title="Remove this track (unticks it under Split off)">&#10005;</button>
+        </span>
+      </div>
+      <div class="knob-slot" id="knob-other"></div>
+      <canvas class="lane-meter" id="meter-other" width="120" height="22" title="Other level (dBFS)"></canvas>
+    </div>
+    <div class="body" id="wave-other"><div class="placeholder">Run separation to hear the other parts</div></div>
+  </div>
   <div class="lane hidden" id="lane-backing">
     <div class="side">
       <div class="lane-head">
@@ -265,7 +267,8 @@
         <span class="lane-tools">
           <button class="icon-btn ms-mute" id="mute-backing" title="Mute">M</button>
           <button class="icon-btn ms-solo" id="solo-backing" title="Solo">S</button>
-          <button class="icon-btn ms-dl" id="dlsel-backing" title="Select for download">&#10515;</button>
+          <button class="icon-btn ms-dl" id="dlsel-backing" title="Select for download">&#10003;</button>
+          <button class="icon-btn ms-x" id="rm-backing" title="Remove this track (hide the Backing track)">&#10005;</button>
         </span>
       </div>
       <div class="knob-slot" id="knob-backing"></div>

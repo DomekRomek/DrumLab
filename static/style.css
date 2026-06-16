@@ -240,6 +240,10 @@ button:disabled { opacity: 0.4; cursor: default; }
 }
 .split-pill:hover { border-color: var(--accent); color: var(--text); }
 .split-pill.on { background: var(--accent); border-color: var(--accent); color: #0d1117; font-weight: 600; }
+.split-pill:disabled { opacity: 0.35; cursor: default; }
+.split-pill:disabled:hover { border-color: var(--line); color: var(--dim); }
+/* the Backing pill is the remainder, not a source — set it off with a divider */
+.split-div { width: 1px; align-self: stretch; background: var(--line); margin: 2px 3px; }
 
 /* input panel: square dropzone left, params right */
 /* wrap so the params / samples drop to a new line instead of overlapping the
@@ -335,18 +339,20 @@ button.dl.dl-wide { grid-column: 1 / -1; }
    knob + meter + padding) so the controls never overlap when the lane is
    squeezed */
 .lane { display: flex; gap: 8px; flex: 1; min-height: 144px; }
-/* MIDI side packs the most: its lane-head wraps 4 tool buttons onto two rows
-   (~51px) on top of the 6-knob grid + meter, measured at 215px of content. Give
-   it a taller floor so the dBFS meter doesn't clip out the bottom when squeezed. */
+/* MIDI side packs the most: lane-head (name + one tool row) on top of the 6-knob
+   grid + meter. Give it a taller floor so the dBFS meter doesn't clip out the
+   bottom when squeezed. */
 #lane-midi { min-height: 224px; }
 .lane .side {
   width: 148px; flex: none; display: flex; flex-direction: column; justify-content: flex-start;
   align-items: stretch; gap: 4px;
   background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
 }
-.lane-head { display: flex; align-items: flex-start; justify-content: space-between; flex: none; }
+/* name on top, the M/S/select/remove buttons in one row beneath it — a 2x2 grid
+   pushed the knob down and clipped its "Gain" label when a lane had four tools */
+.lane-head { display: flex; flex-direction: column; align-items: stretch; gap: 4px; flex: none; }
 .lane-name { font-size: 12px; font-weight: 600; letter-spacing: 0.5px; color: var(--dim); }
-.lane-tools { display: flex; gap: 3px; flex-wrap: wrap; justify-content: flex-end; max-width: 56px; }
+.lane-tools { display: flex; gap: 3px; }
 .lane .knob-slot { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
 .lane .lane-meter { flex: none; margin-top: auto; }
 .icon-btn.ms-mute.active { background: var(--stop); border-color: var(--stop); color: #fff; }

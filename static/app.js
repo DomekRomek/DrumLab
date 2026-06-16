@@ -37,8 +37,9 @@ const ROLL_LABEL = { kick: "Kick", snare: "Snare", hihat: "Hi-hat", tom: "Tom", 
 // hidden per-instrument trim: evens out raw synth loudness so the user-facing
 // knobs all sit at 0 dB (snare carries the groove; metals are tamed hard)
 const CLASS_TRIM = { kick: 0.9, snare: 1.0, hihat: 0.22, tom: 0.9, cymbal: 0.22 };
-// Demucs full-separation sources (order matches the backend) + the derived backing.
-const SOURCES = ["drums", "bass", "other", "vocals"];
+// Demucs full-separation sources (display/lane order) + the derived backing. The
+// backend writes the same four stems; names match, so order here is UI-only.
+const SOURCES = ["drums", "bass", "vocals", "other"];
 const STEM_LANES = [...SOURCES, "backing"];        // separation-driven lanes
 const LANE_NAMES = ["input", ...STEM_LANES];       // all audio lanes (no MIDI)
 const LANE_CONT = Object.fromEntries(LANE_NAMES.map((k) => [k, "wave-" + k]));
@@ -1255,8 +1256,10 @@ function getDevice() { return document.querySelector('input[name="device"]:check
 /* separation selection: which sources to split off, which to download */
 /* ------------------------------------------------------------------ */
 // splitSel: sources that get their own lane (the rest sum into Backing).
-const splitSel = { drums: true, bass: false, other: false, vocals: false };
-// dlSel: stem lanes ticked for "Download selected" (the ⤓ button on each lane).
+const splitSel = { drums: true, bass: false, vocals: false, other: false };
+// showBacking: user's intent to keep the Backing track (toggled via its pill / × ).
+let showBacking = true;
+// dlSel: stem lanes ticked for "Download selected" (the ✓ button on each lane).
 const dlSel = {};
 for (const k of STEM_LANES) dlSel[k] = false;
 const stageHidden = { dm: false, ad: false };
@@ -1266,9 +1269,15 @@ function presentSources() {
   return (lastState && lastState.stems) ? lastState.stems.sources : SOURCES;
 }
 function backingParts() { return presentSources().filter((s) => !splitSel[s]); }
+// Backing only makes sense as its own track when it's a proper, non-empty subset:
+// all sources split off -> empty; nothing split off -> identical to the input.
+function backingMakesSense() {
+  const off = presentSources().filter((s) => splitSel[s]).length;
+  return off >= 1 && backingParts().length >= 1;
+}
 
 function laneVisible(name) {
-  if (name === "backing") return !stageHidden.dm && backingParts().length > 0;
+  if (name === "backing") return !stageHidden.dm && showBacking && backingMakesSense();
   if (SOURCES.includes(name)) return !stageHidden.dm && splitSel[name];
   return true;
 }
@@ -1292,9 +1301,8 @@ function renderStemLanes() {
   }
   // backing = the unsplit sources, summed on the server (keyed by composition)
   $("lane-backing").classList.toggle("hidden", !laneVisible("backing"));
-  const bp = backingParts();
-  const sig = bp.join(",");
-  if (stems && bp.length) {
+  const sig = backingParts().join(",");
+  if (stems && showBacking && backingMakesSense()) {
     if (engine._backingSig !== sig) {
       engine._backingSig = sig;
       const q = "&parts=" + encodeURIComponent(sig);
@@ -1304,7 +1312,19 @@ function renderStemLanes() {
     engine._backingSig = null;
     disposeLane("backing");
   }
+  syncSplitPills();
   updateDlSelected();
+}
+
+// keep the Split-off pills (incl. Backing) in step with the selection state
+function syncSplitPills() {
+  for (const pill of document.querySelectorAll("#dm-split .split-pill[data-src]")) {
+    pill.classList.toggle("on", !!splitSel[pill.dataset.src]);
+  }
+  const bk = $("split-backing");
+  const sensible = backingMakesSense();
+  bk.disabled = !sensible;
+  bk.classList.toggle("on", sensible && showBacking);
 }
 
 function updateDlSelected() {
@@ -1316,24 +1336,26 @@ function updateDlSelected() {
   $("dl-selected").disabled = !ready;
 }
 
-// split-off pills
-for (const pill of document.querySelectorAll("#dm-split .split-pill")) {
+// split-off pills (one per source) + the Backing toggle pill
+for (const pill of document.querySelectorAll("#dm-split .split-pill[data-src]")) {
   pill.addEventListener("click", () => {
-    const src = pill.dataset.src;
-    splitSel[src] = !splitSel[src];
-    pill.classList.toggle("on", splitSel[src]);
+    splitSel[pill.dataset.src] = !splitSel[pill.dataset.src];
     renderStemLanes();
   });
 }
+$("split-backing").addEventListener("click", () => {
+  if (!backingMakesSense()) return;
+  showBacking = !showBacking;
+  renderStemLanes();
+});
 
-// per-lane download-select (⤓) and remove (×) buttons
+// per-lane download-select (✓) and remove (×) buttons
 for (const k of STEM_LANES) {
   $("dlsel-" + k).addEventListener("click", () => { dlSel[k] = !dlSel[k]; updateDlSelected(); });
   const rm = $("rm-" + k);
   if (rm) rm.addEventListener("click", () => {
-    splitSel[k] = false;
-    const pill = document.querySelector('#dm-split .split-pill[data-src="' + k + '"]');
-    if (pill) pill.classList.remove("on");
+    if (k === "backing") showBacking = false;   // Backing's × just hides the track
+    else splitSel[k] = false;                    // a source's × folds it back into Backing
     renderStemLanes();
   });
 }
