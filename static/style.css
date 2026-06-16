@@ -335,10 +335,10 @@ button.dl.dl-wide { grid-column: 1 / -1; }
    (min-content / flex:1 0 auto) would pull in the waveform canvas height and
    feed back through the WaveSurfer height-sync. */
 #lanes { flex: 1; display: flex; flex-direction: column; gap: 4px; padding: 4px 14px 8px; min-height: 680px; }
-/* min-height must clear the side-panel contents (measured 138px: head + 60px
-   knob + meter + padding) so the controls never overlap when the lane is
-   squeezed */
-.lane { display: flex; gap: 8px; flex: 1; min-height: 144px; }
+/* min-height must clear the side-panel contents so the gain knob never overlaps
+   the tool buttons above it or the meter below when many lanes squeeze each lane
+   to its floor: padding(12) + gaps(8) + head(~44) + knob-slot(78) + meter(22). */
+.lane { display: flex; gap: 8px; flex: 1; min-height: 168px; }
 /* MIDI side packs the most: lane-head (name + one tool row) on top of the 6-knob
    grid + meter. Give it a taller floor so the dBFS meter doesn't clip out the
    bottom when squeezed. */
@@ -354,6 +354,10 @@ button.dl.dl-wide { grid-column: 1 / -1; }
 .lane-name { font-size: 12px; font-weight: 600; letter-spacing: 0.5px; color: var(--dim); }
 .lane-tools { display: flex; gap: 3px; }
 .lane .knob-slot { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
+/* the gain knob + its label live in a padded slot that can't be crushed below
+   their own size (60px dial + 10px label) — flex:1 lets it grow, the min-height
+   floor stops it collapsing onto the buttons/meter when the lane is squeezed */
+.lane .side > .knob-slot { min-height: 78px; padding: 4px 0; box-sizing: border-box; }
 .lane .lane-meter { flex: none; margin-top: auto; }
 .icon-btn.ms-mute.active { background: var(--stop); border-color: var(--stop); color: #fff; }
 .icon-btn.ms-solo.active { background: var(--pause); border-color: var(--pause); color: #0d1117; }
