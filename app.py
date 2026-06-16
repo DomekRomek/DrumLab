@@ -44,10 +44,10 @@ from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "1.0"
+APP_VERSION = "2.0"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -66,6 +66,13 @@ WORKER = APP_DIR / "adtof_worker.py"
 # [0.22, 0.24, 0.32, 0.22, 0.30] are in THIS order.
 CH_NAMES = ["kick", "snare", "tom", "hihat", "cymbal"]
 DEFAULT_THRESHOLDS = {"kick": 0.22, "snare": 0.24, "tom": 0.32, "hihat": 0.22, "cymbal": 0.30}
+# Onset-latency compensation: the model's activation peaks a few frames AFTER the
+# real transient (spectrogram framing is center=True, so i/fps is otherwise exact),
+# so every picked hit lands late against the audio. Shift all onsets earlier by this
+# many seconds. Applied once in do_pick(), so it flows to the roll, the synth, and the
+# MIDI/MusicXML exports alike. TWEAK ME by ear: raise if the synth still trails the
+# track, lower if it now anticipates; a re-pick (instant) applies the new value.
+ONSET_COMP_SEC = 0.08
 # GM percussion pitches for exported MIDI (user-requested map).
 GM_MAP = {"kick": 36, "snare": 38, "hihat": 42, "tom": 45, "cymbal": 49}
 GRID_Q = {"1/8": Fraction(1, 2), "1/16": Fraction(1, 4), "1/16T": Fraction(1, 6), "1/32": Fraction(1, 8)}
@@ -345,7 +352,9 @@ def do_pick(thresholds: dict) -> dict:
     th = [float(thresholds.get(n, DEFAULT_THRESHOLDS[n])) for n in CH_NAMES]
     picker = PP.PeakPicker(thresholds=th, fps=int(acts_info["fps"]))
     picked = picker.pick(arr, labels=list(range(5)), label_offset=0)[0]
-    events = {CH_NAMES[i]: [round(float(t), 5) for t in picked[i]] for i in range(5)}
+    # shift onsets earlier to cancel the model's activation latency (see ONSET_COMP_SEC)
+    events = {CH_NAMES[i]: [round(max(0.0, float(t) - ONSET_COMP_SEC), 5) for t in picked[i]]
+              for i in range(5)}
     with STATE_LOCK:
         PICK_REV[0] += 1
         STATE["pick"] = {
@@ -526,7 +535,10 @@ app = FastAPI(title="DrumLab", version=APP_VERSION, docs_url=None, redoc_url=Non
 
 @app.get("/")
 def index():
-    return FileResponse(APP_DIR / "static" / "index.html")
+    # inject the version so the footer is correct on first paint (the JS poll also
+    # keeps it in sync, but this makes view-source / a stale poll show the real one)
+    html = (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")
+    return Response(content=html.replace("__VER__", APP_VERSION), media_type="text/html")
 
 
 @app.post("/api/upload")
@@ -641,6 +653,7 @@ def adtof_pick(params: dict):
 def get_state():
     pick = STATE["pick"]
     return {
+        "version": APP_VERSION,
         "input": STATE["input"],
         "stem": {"key": STATE["stem"]["key"],
                  "nodrums": bool(STATE["stem"].get("nodrums"))} if STATE["stem"] else None,
@@ -670,6 +683,91 @@ def get_audio(which: str):
     if which == "nodrums" and STATE["stem"] and STATE["stem"].get("nodrums"):
         return FileResponse(STATE["stem"]["nodrums"], media_type="audio/wav")
     raise HTTPException(404, f"No {which} audio available")
+
+
+# Chunked, pitch-preserved playback streaming. The client plays audio as a window
+# of short chunks scheduled on the Web Audio clock, so RAM is bounded by the window
+# (not the song length) and stays sample-aligned with the MIDI. Speed changes reuse
+# the export's atempo: one continuous whole-file stretch (no per-chunk seams), cached,
+# then sliced on demand. Slicing a PCM WAV with input-seek is sample-accurate.
+CHUNKS = WORK / "chunks"
+CHUNKS.mkdir(parents=True, exist_ok=True)
+CHUNK_SEC = 8.0                       # content seconds per chunk (must match app.js)
+_STRETCH_GUARD = threading.Lock()
+_STRETCH_LOCKS: dict = {}             # cache path -> per-file lock (one render at a time)
+# render stretches below normal priority so they never starve demucs/adtof inference
+_LOW_PRIO = subprocess.CREATE_NO_WINDOW | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+
+
+def _lane_source(lane: str):
+    """(source wav path, stable cache key) for a playback lane, or 404/409."""
+    if lane == "input" and STATE["input"]:
+        return STATE["input"]["wav"], STATE["input"]["id"]
+    if lane == "stem" and STATE["stem"]:
+        return STATE["stem"]["wav"], STATE["stem"]["key"] + "_drums"
+    if lane == "nodrums" and STATE["stem"] and STATE["stem"].get("nodrums"):
+        return STATE["stem"]["nodrums"], STATE["stem"]["key"] + "_nodrums"
+    raise HTTPException(404, f"No {lane} audio available")
+
+
+def _evict_stretch_cache(keep_bytes: int = 1_500_000_000):
+    """LRU-cap the whole-file stretched WAVs (they are large)."""
+    files = sorted(CHUNKS.glob("*x.wav"), key=lambda p: p.stat().st_mtime)
+    total = sum(p.stat().st_size for p in files)
+    while total > keep_bytes and len(files) > 1:
+        victim = files.pop(0)
+        total -= victim.stat().st_size
+        victim.unlink(missing_ok=True)
+
+
+def _ensure_stretched(src: str, key: str, speed: float) -> Path:
+    """Path to a whole-file atempo-stretched WAV for (lane, speed), rendered once."""
+    cached = CHUNKS / f"{key}_{speed:.4f}x.wav"
+    if cached.exists():
+        os.utime(cached, None)        # mark recently used for LRU
+        return cached
+    with _STRETCH_GUARD:
+        lock = _STRETCH_LOCKS.setdefault(str(cached), threading.Lock())
+    with lock:                        # collapse concurrent first-hits into one render
+        if cached.exists():
+            return cached
+        tmp = cached.with_suffix(".tmp.wav")
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src), "-filter:a", f"atempo={speed:.4f}",
+             "-c:a", "pcm_s16le", str(tmp)],
+            capture_output=True, creationflags=_LOW_PRIO, timeout=600)
+        if r.returncode != 0 or not tmp.exists():
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(500, "Stretch failed: " + r.stderr.decode("utf-8", "replace")[-300:])
+        tmp.replace(cached)
+        _evict_stretch_cache()
+        return cached
+
+
+@app.get("/api/audio_chunk")
+def audio_chunk(lane: str, i: int, speed: float = 1.0):
+    """One playback chunk: content window [i*CHUNK_SEC, +CHUNK_SEC] at the given speed,
+    returned as a small WAV slice. speed != 1 plays a slice of the cached whole-file
+    stretch; file-time = content-time / speed (the stretch slows the timeline by speed)."""
+    speed = max(0.5, min(1.5, float(speed)))
+    src, key = _lane_source(lane)
+    if abs(speed - 1.0) > 1e-3:
+        src = str(_ensure_stretched(src, key, speed))
+    f0 = max(0.0, (i * CHUNK_SEC) / speed)
+    fdur = CHUNK_SEC / speed
+    tmp = CHUNKS / f"_slice_{os.getpid()}_{threading.get_ident()}.wav"
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{f0:.6f}", "-t", f"{fdur:.6f}", "-i", src,
+             "-c:a", "pcm_s16le", str(tmp)],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=120)
+        if r.returncode != 0 or not tmp.exists():
+            raise HTTPException(500, "Slice failed: " + r.stderr.decode("utf-8", "replace")[-300:])
+        data = tmp.read_bytes()
+    finally:
+        tmp.unlink(missing_ok=True)
+    return Response(content=data, media_type="audio/wav",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/art")
@@ -716,7 +814,12 @@ STEM_FMTS = {
 }
 
 
-def stem_download(which: str, fmt: str):
+# Downloads must never be served from a browser/proxy cache: the URL can repeat
+# across songs, and a stale hit hands back a *previous* song's file.
+_NO_STORE = {"Cache-Control": "no-store"}
+
+
+def stem_download(which: str, fmt: str, speed: float = 1.0):
     label = "drum stem" if which == "drums" else "backing track"
     stem = STATE["stem"]
     if not stem:
@@ -727,18 +830,22 @@ def stem_download(which: str, fmt: str):
     if fmt not in STEM_FMTS:
         raise HTTPException(400, f"Invalid audio format -- use one of {list(STEM_FMTS)}")
     args, ext, mime, tag = STEM_FMTS[fmt]
-    nice = out_name(f"_{which}{tag}.{ext}")
-    if fmt == "wav":
-        return FileResponse(src, media_type=mime, filename=nice)
-    cached = OUT / f"{stem['key']}_{which}_{fmt}.{ext}"
+    stretch = abs(speed - 1.0) > 1e-3
+    stag = f"_{speed:g}x" if stretch else ""
+    nice = out_name(f"_{which}{tag}{stag}.{ext}")
+    if fmt == "wav" and not stretch:
+        return FileResponse(src, media_type=mime, filename=nice, headers=_NO_STORE)
+    cached = OUT / f"{stem['key']}_{which}_{fmt}{stag}.{ext}"
     if not cached.exists():
+        # atempo time-stretches with pitch preserved; matches the Speed-knob playback
+        filt = ["-filter:a", f"atempo={speed:.4f}"] if stretch else []
         r = subprocess.run(
-            ["ffmpeg", "-y", "-i", src] + args + [str(cached)],
+            ["ffmpeg", "-y", "-i", src] + filt + args + [str(cached)],
             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=600,
         )
         if r.returncode != 0 or not cached.exists():
             raise HTTPException(500, "FFmpeg conversion failed: " + r.stderr.decode("utf-8", "replace")[-300:])
-    return FileResponse(cached, media_type=mime, filename=nice)
+    return FileResponse(cached, media_type=mime, filename=nice, headers=_NO_STORE)
 
 
 @app.post("/api/reset")
@@ -765,32 +872,44 @@ def reset():
 
 
 @app.get("/api/download/{kind}")
-def download(kind: str, grid: str = "1/16", fmt: str = "wav"):
+def download(kind: str, grid: str = "1/16", fmt: str = "wav", speed: float = 1.0):
     if grid not in GRID_Q:
         raise HTTPException(400, f"Invalid grid -- use one of {list(GRID_Q)}")
+    speed = max(0.5, min(2.0, float(speed)))  # atempo's single-pass range
     if kind == "stem":
-        return stem_download("drums", fmt)
+        return stem_download("drums", fmt, speed)
     if kind == "nodrums":
-        return stem_download("no_drums", fmt)
+        return stem_download("no_drums", fmt, speed)
     pick, acts = require_pick()
     tempo = effective_tempo(acts)
+    # "Match playback speed": stretch event times by 1/speed and the embedded tempo by
+    # speed, so the MIDI lines up with the speed-stretched audio. Quantization slots are
+    # unchanged (the speed cancels), so the notation is identical, only the tempo differs.
+    stretch = abs(speed - 1.0) > 1e-3
+    if stretch:
+        events = {cls: [t / speed for t in times] for cls, times in pick["events"].items()}
+        tempo *= speed
+        stag = f"_{speed:g}x"
+    else:
+        events = pick["events"]
+        stag = ""
     if kind == "midi":
-        path = OUT / out_name("_adtof_raw.mid")
-        build_midi(pick["events"], tempo, path)
-        return FileResponse(path, media_type="audio/midi", filename=path.name)
+        path = OUT / out_name(f"_adtof_raw{stag}.mid")
+        build_midi(events, tempo, path)
+        return FileResponse(path, media_type="audio/midi", filename=path.name, headers=_NO_STORE)
     if kind == "midi_quant":
         gtag = grid.replace("/", "")
-        path = OUT / out_name(f"_adtof_q{gtag}.mid")
-        build_quant_midi(pick["events"], tempo, grid, path)
-        return FileResponse(path, media_type="audio/midi", filename=path.name)
+        path = OUT / out_name(f"_adtof_q{gtag}{stag}.mid")
+        build_quant_midi(events, tempo, grid, path)
+        return FileResponse(path, media_type="audio/midi", filename=path.name, headers=_NO_STORE)
     if kind == "musicxml":
-        path = OUT / out_name("_adtof.musicxml")
+        path = OUT / out_name(f"_adtof{stag}.musicxml")
         try:
-            build_musicxml(pick["events"], tempo, grid, path)
+            build_musicxml(events, tempo, grid, path)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(500, f"MusicXML export failed (music21): {e}")
         return FileResponse(path, media_type="application/vnd.recordare.musicxml+xml",
-                            filename=path.name)
+                            filename=path.name, headers=_NO_STORE)
     raise HTTPException(404, "Unknown download kind")
 
 
