@@ -47,7 +47,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "2.3"
+APP_VERSION = "2.5"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -869,11 +869,16 @@ _NO_STORE = {"Cache-Control": "no-store"}
 
 
 def _render_stem(which: str, fmt: str, speed: float, parts: Optional[str]) -> tuple:
-    """Render one stem ('drums'/'bass'/'other'/'vocals' or 'backing') to the chosen
-    format and speed. Returns (path, download filename, mimetype)."""
+    """Render one stem ('input'/'drums'/'bass'/'other'/'vocals' or 'backing') to the
+    chosen format and speed. Returns (path, download filename, mimetype)."""
     if fmt not in STEM_FMTS:
         raise HTTPException(400, f"Invalid audio format -- use one of {list(STEM_FMTS)}")
-    if which == "backing":
+    if which == "input":
+        if not STATE["input"]:
+            raise HTTPException(409, "No input loaded")
+        src = str(STATE["input"]["wav"])
+        skey = STATE["input"]["id"]
+    elif which == "backing":
         src, skey = _ensure_backing(_parse_parts(parts))
         src = str(src)
     elif which in SOURCES and STATE["stems"] and which in STATE["stems"]["sources"]:
@@ -904,10 +909,10 @@ def _render_stem(which: str, fmt: str, speed: float, parts: Optional[str]) -> tu
 def download_stems(stems: str, fmt: str = "flac", speed: float = 1.0, backing: Optional[str] = None):
     """Download the selected stems. One stem -> that file; several -> a single ZIP.
 
-    `stems` is a comma-separated list of source names and/or 'backing'; `backing`
-    gives the backing composition (the sources summed into it)."""
+    `stems` is a comma-separated list of source names and/or 'backing'/'input';
+    `backing` gives the backing composition (the sources summed into it)."""
     speed = max(0.5, min(2.0, float(speed)))
-    wanted = [s for s in dict.fromkeys((stems or "").split(",")) if s in SOURCES or s == "backing"]
+    wanted = [s for s in dict.fromkeys((stems or "").split(",")) if s in SOURCES or s in ("backing", "input")]
     if not wanted:
         raise HTTPException(400, "No stems selected")
     rendered = [_render_stem(w, fmt, speed, backing) for w in wanted]

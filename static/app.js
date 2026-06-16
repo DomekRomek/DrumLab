@@ -1259,9 +1259,10 @@ function getDevice() { return document.querySelector('input[name="device"]:check
 const splitSel = { drums: true, bass: false, vocals: false, other: false };
 // showBacking: user's intent to keep the Backing track (toggled via its pill / × ).
 let showBacking = true;
-// dlSel: stem lanes ticked for "Download selected" (the ✓ button on each lane).
+// dlSel: audio lanes ticked for "Download selected" (the □ button on each lane) —
+// the stems, Backing, and the raw Input (e.g. grab the original at a changed speed).
 const dlSel = {};
-for (const k of STEM_LANES) dlSel[k] = false;
+for (const k of LANE_NAMES) dlSel[k] = false;
 const stageHidden = { dm: false, ad: false };
 
 // sources present on disk (all four, until a separation tells us otherwise)
@@ -1328,12 +1329,11 @@ function syncSplitPills() {
 }
 
 function updateDlSelected() {
-  for (const k of STEM_LANES) {
+  for (const k of LANE_NAMES) {
     const btn = $("dlsel-" + k);
     if (btn) btn.classList.toggle("active", !!dlSel[k]);
   }
-  const ready = !!(lastState && lastState.stems) && selectedStems().length > 0;
-  $("dl-selected").disabled = !ready;
+  $("dl-selected").disabled = selectedStems().length === 0;
 }
 
 // split-off pills (one per source) + the Backing toggle pill
@@ -1349,8 +1349,8 @@ $("split-backing").addEventListener("click", () => {
   renderStemLanes();
 });
 
-// per-lane download-select (✓) and remove (×) buttons
-for (const k of STEM_LANES) {
+// per-lane download-select (□) and remove (×) buttons
+for (const k of LANE_NAMES) {
   $("dlsel-" + k).addEventListener("click", () => { dlSel[k] = !dlSel[k]; updateDlSelected(); });
   const rm = $("rm-" + k);
   if (rm) rm.addEventListener("click", () => {
@@ -1517,13 +1517,23 @@ function dlURL(kind) {
     "&v=" + v;
 }
 
-// the stem lanes currently ticked for download (only ones that actually exist)
+// a lane is downloadable once its audio exists: Input as soon as it's loaded, the
+// stems + Backing only after separation has run.
+function laneDownloadable(k) {
+  if (!laneVisible(k)) return false;
+  return k === "input" ? !!(lastState && lastState.input)
+                       : !!(lastState && lastState.stems);
+}
+// the audio lanes currently ticked for download (only ones that actually exist)
 function selectedStems() {
-  return STEM_LANES.filter((k) => dlSel[k] && laneVisible(k));
+  return LANE_NAMES.filter((k) => dlSel[k] && laneDownloadable(k));
 }
 function dlStemsURL() {
   const speed = $("out-speed").checked ? engine.speed : 1;
-  const key = (lastState && lastState.stems && lastState.stems.key) || "";
+  // key the cache-buster off the stems when present, else the input id, so an
+  // Input-only download still varies per song (see [[drumlab-download-cachebust]]).
+  const key = (lastState && lastState.stems && lastState.stems.key)
+           || (lastState && lastState.input && lastState.input.id) || "";
   const v = encodeURIComponent([key, selectedStems().join("+")].join("-"));
   let url = "/api/download_stems?stems=" + encodeURIComponent(selectedStems().join(",")) +
     "&fmt=" + encodeURIComponent($("out-fmt").value) +
