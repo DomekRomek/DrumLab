@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 DomekRomek
 r"""DRUMLAB -- local drum-transcription control GUI
 ==================================================
 
@@ -31,7 +33,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "3.2"
+APP_VERSION = "4.0"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
