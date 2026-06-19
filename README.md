@@ -1,5 +1,7 @@
 # Drumlab
 
+![Drumlab](screenshot.png)
+
 A GUI wrapper around [Demucs](https://github.com/adefossez/demucs) and
 [ADTOF](https://github.com/xavriley/ADTOF-pytorch) that separates a song into
 its individual parts — drums, bass, vocals, the rest — transcribes the drums
