@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 DomekRomek
 """ADTOF inference worker.
 
 Run as a separate, killable subprocess by app.py. Loads the ADTOF Frame_RNN
