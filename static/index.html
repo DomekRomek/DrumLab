@@ -17,6 +17,23 @@
     <div id="transport">
       <button id="btn-play" class="t-play" title="Play / pause (space)">&#9654;</button>
       <button id="btn-stop" class="t-stop" title="Stop and return to start"><svg width="13" height="13" viewBox="0 0 13 13"><rect width="13" height="13" rx="2" fill="currentColor"/></svg></button>
+      <div class="hdr-group" title="Playlist — party shuffle and song library">
+        <button id="btn-shuffle" class="hdr-icon off" disabled title="Select a library folder to enable party shuffle">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="16 3 21 3 21 8"/>
+            <line x1="4" y1="20" x2="21" y2="3"/>
+            <polyline points="21 16 21 21 16 21"/>
+            <line x1="15" y1="15" x2="21" y2="21"/>
+            <line x1="4" y1="4" x2="9" y2="9"/>
+            <line class="slash" x1="3" y1="3" x2="21" y2="21"/>
+          </svg>
+        </button>
+        <button id="btn-library" class="hdr-icon subtle" title="Song library — pick a folder, then add songs to the up-next queue">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 7a2 2 0 0 1 2-2h3.5l2 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+          </svg>
+        </button>
+      </div>
       <span id="time-display" title="Transport position">0:00.000</span>
     </div>
     <div id="meta-bar">
@@ -60,10 +77,46 @@
           <label><input type="radio" name="device" value="cuda" checked><span>CUDA</span></label>
           <label><input type="radio" name="device" value="cpu"><span>CPU</span></label>
         </div>
+        <div class="sample-pad" title="Drop a one-shot audio file on a pad to use it as that drum's sound instead of the built-in synth. Click the × to revert.">
+          <div class="sample-head">Custom MIDI samples</div>
+          <div id="sample-slots"></div>
+        </div>
       </div>
-      <div class="sample-pad" title="Drop a one-shot audio file on a pad to use it as that drum's sound instead of the built-in synth. Click the × to revert.">
-        <div class="sample-head">Custom MIDI samples</div>
-        <div id="sample-slots"></div>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-queue" title="Up-next queue. Add songs from the library (folder button), or turn on party shuffle to auto-queue random songs.">
+    <h2>Up Next</h2>
+    <div class="queue-head">
+      <span id="queue-count" class="hint"></span>
+      <button id="queue-prev" class="q-mini" title="Load the previous song (back through play history)" disabled>&#9198;</button>
+      <button id="queue-next" class="q-mini" title="Load the next song in the queue" disabled>&#9197;</button>
+      <button id="queue-clear" class="q-mini" title="Clear the queue" disabled>&#10005;</button>
+    </div>
+    <div id="queue-list"></div>
+    <div id="queue-empty" class="hint">Queue is empty. Pick a library folder, then add songs or turn on party shuffle.</div>
+  </div>
+
+  <div id="library-modal" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <span id="library-title">Library</span>
+        <button id="library-close" class="q-mini" title="Close">&#10005;</button>
+      </div>
+      <div id="library-browse">
+        <div id="browse-path" class="hint"></div>
+        <div id="browse-drives"></div>
+        <div id="browse-list"></div>
+        <div class="modal-actions">
+          <button id="browse-use" class="ghost-btn">Use this folder</button>
+        </div>
+      </div>
+      <div id="library-songs" class="hidden">
+        <div class="modal-actions modal-actions-top">
+          <input type="text" id="song-search" placeholder="Filter songs / artists …">
+          <button id="library-changedir" class="ghost-btn" title="Index a different / additional folder">Change folder</button>
+        </div>
+        <div id="song-list"></div>
       </div>
     </div>
   </div>

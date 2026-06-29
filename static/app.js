@@ -1440,6 +1440,275 @@ $("dropzone").addEventListener("drop", (e) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* library / playlist — party shuffle + curated queue, RAM only        */
+/* ------------------------------------------------------------------ */
+// The queue lives entirely client-side; the server only indexes files (/api/library)
+// and loads one by path (/api/load_path, which feeds the same poll() refresh as upload).
+const PARTY_TARGET = 5;   // keep at least this many songs queued while party shuffle is on
+const HISTORY_MAX = 5;    // how many previously-played songs Prev can step back through
+const playlist = {
+  songs: [],          // [{path, name, artist}] — the indexed library
+  configured: false,  // any --library / picked root present?
+  queue: [],          // upcoming [{path,name,artist}]; index 0 = the next to load
+  history: [],        // previously-played songs, most-recent-last (cap HISTORY_MAX)
+  current: null,      // the song currently loaded via the queue (null if uploaded manually)
+  party: false,
+  loading: false,
+};
+
+function updateShuffleBtn() {
+  const btn = $("btn-shuffle");
+  const on = playlist.party && playlist.configured;
+  btn.disabled = !playlist.configured;
+  btn.classList.toggle("on", on);
+  btn.classList.toggle("off", !on);
+  btn.title = !playlist.configured
+    ? "Select a library folder to enable party shuffle"
+    : playlist.party
+      ? "Party shuffle ON — auto-queuing random songs. Click to turn off."
+      : "Party shuffle OFF — click to auto-queue random songs from your library.";
+}
+
+function renderQueue() {
+  const list = $("queue-list");
+  const q = playlist.queue;
+  $("queue-count").textContent = q.length ? q.length + " queued" : "";
+  $("queue-prev").disabled = playlist.history.length === 0 || playlist.loading;
+  $("queue-next").disabled = q.length === 0 || playlist.loading;
+  $("queue-clear").disabled = q.length === 0;
+  $("queue-empty").classList.toggle("hidden", q.length > 0);
+  list.innerHTML = "";
+  q.forEach((song, i) => {
+    const row = document.createElement("div");
+    row.className = "queue-row" + (i === 0 ? " next" : "");
+    row.title = "Load " + song.name + (song.artist ? " — " + song.artist : "");
+    const txt = document.createElement("div");
+    txt.className = "qr-text";
+    const nm = document.createElement("div"); nm.className = "qr-name"; nm.textContent = song.name;
+    const ar = document.createElement("div"); ar.className = "qr-artist"; ar.textContent = song.artist || "";
+    txt.appendChild(nm); txt.appendChild(ar);
+    const del = document.createElement("button");
+    del.className = "qr-del"; del.innerHTML = "&times;"; del.title = "Remove from queue";
+    del.addEventListener("click", (e) => { e.stopPropagation(); removeFromQueue(i); });
+    row.appendChild(txt); row.appendChild(del);
+    row.addEventListener("click", () => loadFromQueue(i));
+    list.appendChild(row);
+  });
+}
+
+function partyFill() {
+  if (!playlist.party || !playlist.songs.length) return;
+  const queued = new Set(playlist.queue.map((s) => s.path));
+  const allowDupes = playlist.songs.length <= PARTY_TARGET;
+  let guard = 0;
+  while (playlist.queue.length < PARTY_TARGET && guard++ < 1000) {
+    const pick = playlist.songs[Math.floor(Math.random() * playlist.songs.length)];
+    if (queued.has(pick.path) && !allowDupes) continue;
+    queued.add(pick.path);
+    playlist.queue.push(pick);
+  }
+}
+
+function enqueue(song) { playlist.queue.push(song); renderQueue(); }
+
+function removeFromQueue(i) {
+  playlist.queue.splice(i, 1);
+  partyFill();
+  renderQueue();
+}
+
+function clearQueue() { playlist.queue = []; renderQueue(); }
+
+async function loadSong(song) {
+  if (playlist.loading) return;
+  playlist.loading = true;
+  renderQueue();
+  $("file-name").textContent = "Loading " + song.name + " …";
+  try {
+    const r = await postJSON("/api/load_path", { path: song.path });
+    setLog("Loaded " + r.input.name);
+    poll(true);
+  } catch (e) {
+    setLog("Load failed: " + e.message, true);
+  } finally {
+    playlist.loading = false;
+    renderQueue();
+  }
+}
+
+// Make `song` the current track; the song it replaces moves onto the history stack.
+function goToSong(song) {
+  if (playlist.current) {
+    playlist.history.push(playlist.current);
+    if (playlist.history.length > HISTORY_MAX) playlist.history.shift();
+  }
+  playlist.current = song;
+  renderQueue();
+  loadSong(song);
+}
+
+function loadFromQueue(i) {
+  if (playlist.loading) return;
+  const song = playlist.queue[i];
+  if (!song) return;
+  playlist.queue.splice(0, i + 1);   // drop the chosen song and any you skipped past
+  partyFill();
+  goToSong(song);
+}
+
+function nextSong() {
+  if (playlist.loading) return;
+  if (!playlist.queue.length) partyFill();
+  if (playlist.queue.length) loadFromQueue(0);
+}
+
+// Step back to the previously-played song; the current one returns to the queue front,
+// keeping Prev/Next symmetric.
+function prevSong() {
+  if (playlist.loading || !playlist.history.length) return;
+  const song = playlist.history.pop();
+  if (playlist.current) playlist.queue.unshift(playlist.current);
+  playlist.current = song;
+  renderQueue();
+  loadSong(song);
+}
+
+async function loadLibrary(refresh) {
+  try {
+    const lib = await api("/api/library" + (refresh ? "?refresh=1" : ""));
+    playlist.songs = lib.songs || [];
+    playlist.configured = !!lib.configured;
+    if (!playlist.configured) playlist.party = false;
+    updateShuffleBtn();
+    renderQueue();
+    if (!$("library-songs").classList.contains("hidden")) renderSongList();
+    return lib;
+  } catch (e) {
+    setLog("Library: " + e.message, true);
+  }
+}
+
+$("btn-shuffle").addEventListener("click", () => {
+  if (!playlist.configured) return;
+  playlist.party = !playlist.party;
+  if (playlist.party) partyFill();
+  updateShuffleBtn();
+  renderQueue();
+});
+$("queue-prev").addEventListener("click", prevSong);
+$("queue-next").addEventListener("click", nextSong);
+$("queue-clear").addEventListener("click", clearQueue);
+
+/* ---- library modal: folder picker + song browser ---- */
+let browseDir = "";
+
+function openLibrary() {
+  $("library-modal").classList.remove("hidden");
+  if (playlist.configured) showSongsView(); else showBrowseView();
+}
+function closeLibrary() { $("library-modal").classList.add("hidden"); }
+
+function showBrowseView(dir) {
+  $("library-title").textContent = "Pick a music folder";
+  $("library-browse").classList.remove("hidden");
+  $("library-songs").classList.add("hidden");
+  browseTo(dir || "");
+}
+function showSongsView() {
+  $("library-title").textContent = "Library — click a song to queue it";
+  $("library-browse").classList.add("hidden");
+  $("library-songs").classList.remove("hidden");
+  renderSongList();
+}
+
+function browseItem(iconEntity, label, onClick) {
+  const el = document.createElement("div");
+  el.className = "browse-item";
+  const ico = document.createElement("span");
+  ico.className = "bi-ico"; ico.innerHTML = iconEntity;
+  el.appendChild(ico);
+  el.appendChild(document.createTextNode(label));
+  el.addEventListener("click", onClick);
+  return el;
+}
+
+async function browseTo(dir) {
+  try {
+    const b = await api("/api/browse?dir=" + encodeURIComponent(dir || ""));
+    browseDir = b.dir;
+    $("browse-path").textContent = b.dir;
+    const dr = $("browse-drives");
+    dr.innerHTML = "";
+    (b.drives || []).forEach((d) => {
+      const chip = document.createElement("button");
+      chip.className = "drive-chip"; chip.textContent = d;
+      chip.addEventListener("click", () => browseTo(d));
+      dr.appendChild(chip);
+    });
+    const list = $("browse-list");
+    list.innerHTML = "";
+    if (b.parent) list.appendChild(browseItem("&#8593;", " ..", () => browseTo(b.parent)));
+    b.dirs.forEach((d) => list.appendChild(browseItem("&#128193;", " " + d.name, () => browseTo(d.path))));
+    if (!b.dirs.length && !b.parent) {
+      const e = document.createElement("div"); e.className = "hint"; e.textContent = "No sub-folders here.";
+      list.appendChild(e);
+    }
+  } catch (e) {
+    setLog("Browse: " + e.message, true);
+  }
+}
+
+async function useFolder() {
+  if (!browseDir) return;
+  try {
+    await postJSON("/api/library/roots", { path: browseDir });
+    await loadLibrary();   // server already rescanned on add; fetch the new list
+    showSongsView();
+    setLog("Library folder added: " + browseDir);
+  } catch (e) {
+    setLog("Library: " + e.message, true);
+  }
+}
+
+function renderSongList() {
+  const list = $("song-list");
+  const q = ($("song-search").value || "").toLowerCase();
+  list.innerHTML = "";
+  let lastArtist = null, shown = 0;
+  playlist.songs.forEach((song) => {
+    if (q && !(song.name.toLowerCase().includes(q) || (song.artist || "").toLowerCase().includes(q))) return;
+    if (song.artist !== lastArtist) {
+      lastArtist = song.artist;
+      const g = document.createElement("div");
+      g.className = "song-group"; g.textContent = song.artist || "—";
+      list.appendChild(g);
+    }
+    const el = document.createElement("div");
+    el.className = "song-item"; el.title = "Add to queue";
+    const nm = document.createElement("span"); nm.className = "si-name"; nm.textContent = song.name;
+    el.appendChild(nm);
+    el.addEventListener("click", () => { enqueue(song); setLog("Queued " + song.name); });
+    list.appendChild(el);
+    shown++;
+  });
+  if (!shown) {
+    const e = document.createElement("div"); e.className = "hint";
+    e.textContent = playlist.songs.length ? "No matches." : "No audio files found in this folder.";
+    list.appendChild(e);
+  }
+}
+
+$("btn-library").addEventListener("click", openLibrary);
+$("library-close").addEventListener("click", closeLibrary);
+$("library-changedir").addEventListener("click", () => showBrowseView(browseDir));
+$("browse-use").addEventListener("click", useFolder);
+$("song-search").addEventListener("input", renderSongList);
+$("library-modal").addEventListener("click", (e) => { if (e.target === $("library-modal")) closeLibrary(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("library-modal").classList.contains("hidden")) closeLibrary();
+});
+
+/* ------------------------------------------------------------------ */
 /* run / stop / chaining                                               */
 /* ------------------------------------------------------------------ */
 function demucsParams() {
@@ -1817,5 +2086,6 @@ applyMix();
 renderStemLanes();   // show placeholder lanes for the default selection
 applyZoom();
 poll(true);
+loadLibrary();       // index any --library roots; enables party shuffle if configured
 requestAnimationFrame(raf);
 setLog("DrumLab ready — drop a file to begin");
