@@ -33,7 +33,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "4.2"
+APP_VERSION = "4.3"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -163,6 +163,19 @@ def reset_jobs() -> None:
         job.message = ""
         job.log.clear()
         job.cancelled = False
+
+
+def interrupt_jobs() -> None:
+    """Cancel any running pipeline jobs (separation, transcription) and wait for their
+    threads to tear down, so a newly chosen song can load right away. Navigating the
+    playlist -- Next/Prev or picking a library entry -- always wins over in-flight work.
+    Downloads are plain file responses, not Job slots, so they are unaffected."""
+    for job in (DEMUCS_JOB, ADTOF_JOB):
+        job.cancel()
+    for job in (DEMUCS_JOB, ADTOF_JOB):
+        t = job.thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=10)
 
 STATE_LOCK = threading.Lock()
 # Single global workspace, NOT per-client. DrumLab is a single-user tool, so every
@@ -608,10 +621,11 @@ def upload(file: UploadFile = File(...)):
 @app.post("/api/load_path")
 def load_path(params: dict):
     """Load a song from the on-disk library (by absolute path) into STATE["input"].
-    The path must resolve to a file inside a configured library root (traversal guard)."""
-    if DEMUCS_JOB.status == "running" or ADTOF_JOB.status == "running":
-        raise HTTPException(409, "A job is running -- stop it before changing the input")
-    src = library_file(params.get("path", ""))
+    The path must resolve to a file inside a configured library root (traversal guard).
+    Navigating the playlist interrupts any running separation/transcription -- navigation
+    always wins. Downloads are not jobs, so they keep running. See interrupt_jobs()."""
+    src = library_file(params.get("path", ""))  # validate the path before killing anything
+    interrupt_jobs()
     return {"input": ingest_audio(src.read_bytes(), src.name)}
 
 

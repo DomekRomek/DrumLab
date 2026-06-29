@@ -1522,6 +1522,7 @@ function clearQueue() { playlist.queue = []; renderQueue(); }
 async function loadSong(song) {
   if (playlist.loading) return;
   playlist.loading = true;
+  chainAdtof = null;   // dropping the old song cancels any separation->transcription chain
   renderQueue();
   $("file-name").textContent = "Loading " + song.name + " …";
   try {
