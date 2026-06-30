@@ -182,7 +182,7 @@
       <div class="adtof-side">
         <label title="Model frame rate (frames per second). Changes the preprocessing hop, so a new value re-runs the network. 100 is the rate the model was trained at.">FPS <input type="number" id="ad-fps" min="25" max="200" step="25" value="100"></label>
         <label class="switch" title="Re-detect hits from the cached activation curves on every slider move. Instant — the network is not re-run.">
-          <input type="checkbox" id="ad-live"><span class="track"></span> Auto-apply
+          <input type="checkbox" id="ad-live" checked><span class="track"></span> Auto-apply
         </label>
         <button id="ad-run" class="run" title="Transcribe the input audio directly (ADTOF works best on the raw mix)">Run</button>
         <button id="ad-run-stem" class="run alt" title="Transcribe the Demucs drum stem instead. Runs separation first if needed.">From drums &#8631;</button>

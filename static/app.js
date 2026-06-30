@@ -281,10 +281,11 @@ const classGains = {};
 for (const c of CLASSES) classGains[c.id] = new Tone.Gain(CLASS_TRIM[c.id]).connect(midiBus);
 
 // track mixer state; node gain = knob gain, gated by mute/solo.
-// the separated stems sit at 0 dB but start muted — unmute to hear them.
+// input starts muted but soloed: you hear the raw input first, un-solo it to
+// drop to the unmuted stems + MIDI mix. solo wins over mute, so input is audible.
 const mix = { midi: { gain: 1, mute: false, solo: false, node: midiBus } };
 for (const k of LANE_NAMES) {
-  mix[k] = { gain: 1, mute: k !== "input", solo: false, node: laneGains[k] };
+  mix[k] = { gain: 1, mute: k === "input", solo: k === "input", node: laneGains[k] };
 }
 
 const MIX_TRACKS = [...LANE_NAMES, "midi"];
@@ -318,7 +319,8 @@ function bindMuteSolo(track) {
   });
 }
 for (const t of MIX_TRACKS) bindMuteSolo(t);
-for (const t of STEM_LANES) $("mute-" + t).classList.add("active");  // stems start muted
+$("mute-input").classList.add("active");   // input starts muted...
+$("solo-input").classList.add("active");   // ...but soloed, so it's what you hear first
 
 const taps = { master: makeTap(master), midi: makeTap(midiBus) };
 for (const k of LANE_NAMES) taps[k] = makeTap(laneGains[k]);
