@@ -29,11 +29,11 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "4.6"
+APP_VERSION = "4.7"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -612,8 +612,13 @@ def ingest_audio(data: bytes, filename: str) -> dict:
 
 
 @app.post("/api/upload")
-def upload(file: UploadFile = File(...)):
-    if DEMUCS_JOB.status == "running" or ADTOF_JOB.status == "running":
+def upload(file: UploadFile = File(...), interrupt: str = Form("")):
+    # interrupt=1 marks a playlist-queue load of a dropped local file: navigation always
+    # wins, so cancel running jobs (like load_path) instead of refusing with a 409. The
+    # manual dropzone sends no flag and keeps the guard. See interrupt_jobs().
+    if interrupt:
+        interrupt_jobs()
+    elif DEMUCS_JOB.status == "running" or ADTOF_JOB.status == "running":
         raise HTTPException(409, "A job is running -- stop it before changing the input")
     return {"input": ingest_audio(file.file.read(), file.filename or "input")}
 

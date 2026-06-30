@@ -1483,19 +1483,84 @@ function renderQueue() {
   q.forEach((song, i) => {
     const row = document.createElement("div");
     row.className = "queue-row" + (i === 0 ? " next" : "");
-    row.title = "Load " + song.name + (song.artist ? " — " + song.artist : "");
+    row.title = "Drag to reorder · click to load " + song.name + (song.artist ? " — " + song.artist : "");
     const txt = document.createElement("div");
     txt.className = "qr-text";
     const nm = document.createElement("div"); nm.className = "qr-name"; nm.textContent = song.name;
-    const ar = document.createElement("div"); ar.className = "qr-artist"; ar.textContent = song.artist || "";
+    const ar = document.createElement("div"); ar.className = "qr-artist";
+    ar.textContent = song.artist || (song.local ? "local file" : "");
     txt.appendChild(nm); txt.appendChild(ar);
     const del = document.createElement("button");
     del.className = "qr-del"; del.innerHTML = "&times;"; del.title = "Remove from queue";
     del.addEventListener("click", (e) => { e.stopPropagation(); removeFromQueue(i); });
     row.appendChild(txt); row.appendChild(del);
-    row.addEventListener("click", () => loadFromQueue(i));
+    // Pointer-driven reorder; a press that doesn't move is treated as a click-to-load.
+    row.addEventListener("pointerdown", (e) => startReorder(e, i, row));
     list.appendChild(row);
   });
+}
+
+/* ---- smooth pointer-driven reorder (no native drag ghost / text cursor) ---- */
+let reorder = null;   // active drag: {fromIdx,targetIdx,pointerId,rowEl,startY,moved,centers,step}
+
+function startReorder(e, idx, rowEl) {
+  if (e.pointerType === "mouse" && e.button !== 0) return;  // left button only
+  if (e.target.closest(".qr-del")) return;                  // let the × button work
+  const rows = [...$("queue-list").children];
+  const centers = rows.map((r) => { const b = r.getBoundingClientRect(); return b.top + b.height / 2; });
+  reorder = {
+    fromIdx: idx, targetIdx: idx, pointerId: e.pointerId, rowEl,
+    startY: e.clientY, moved: false, centers,
+    step: centers.length > 1 ? centers[1] - centers[0] : rowEl.getBoundingClientRect().height + 3,
+  };
+  try { rowEl.setPointerCapture(e.pointerId); } catch (_) {}
+  rowEl.addEventListener("pointermove", onReorderMove);
+  rowEl.addEventListener("pointerup", endReorder);
+  rowEl.addEventListener("pointercancel", endReorder);
+}
+
+function onReorderMove(e) {
+  if (!reorder || e.pointerId !== reorder.pointerId) return;
+  const dy = e.clientY - reorder.startY;
+  if (!reorder.moved && Math.abs(dy) < 4) return;   // small jitter = still a click, not a drag
+  reorder.moved = true;
+  e.preventDefault();
+  $("queue-list").classList.add("reordering");
+  reorder.rowEl.classList.add("dragging");
+  reorder.rowEl.style.transform = `translateY(${dy}px)`;
+  // target = how many other rows now sit above the dragged row's centre = its post-removal index
+  const draggedCenter = reorder.centers[reorder.fromIdx] + dy;
+  let target = 0;
+  for (let k = 0; k < reorder.centers.length; k++) {
+    if (k !== reorder.fromIdx && reorder.centers[k] < draggedCenter) target++;
+  }
+  reorder.targetIdx = target;
+  // slide the other rows to open a gap where the dragged row will land
+  [...$("queue-list").children].forEach((r, k) => {
+    if (k === reorder.fromIdx) return;
+    let shift = 0;
+    if (target > reorder.fromIdx && k > reorder.fromIdx && k <= target) shift = -reorder.step;
+    else if (target < reorder.fromIdx && k >= target && k < reorder.fromIdx) shift = reorder.step;
+    r.style.transform = shift ? `translateY(${shift}px)` : "";
+  });
+}
+
+function endReorder(e) {
+  if (!reorder || e.pointerId !== reorder.pointerId) return;
+  const { rowEl, fromIdx, targetIdx, moved } = reorder;
+  rowEl.removeEventListener("pointermove", onReorderMove);
+  rowEl.removeEventListener("pointerup", endReorder);
+  rowEl.removeEventListener("pointercancel", endReorder);
+  try { rowEl.releasePointerCapture(reorder.pointerId); } catch (_) {}
+  reorder = null;
+  $("queue-list").classList.remove("reordering");
+  if (e.type === "pointercancel") { renderQueue(); return; }   // aborted — reset, don't commit
+  if (!moved) { loadFromQueue(fromIdx); return; }              // a tap → load it
+  if (targetIdx !== fromIdx) {
+    const item = playlist.queue.splice(fromIdx, 1)[0];
+    playlist.queue.splice(targetIdx, 0, item);
+  }
+  renderQueue();   // rebuild clean (clears the inline transforms)
 }
 
 function partyFill() {
@@ -1528,7 +1593,16 @@ async function loadSong(song) {
   renderQueue();
   $("file-name").textContent = "Loading " + song.name + " …";
   try {
-    const r = await postJSON("/api/load_path", { path: song.path });
+    let r;
+    if (song.file) {
+      // a dropped local file: upload it. interrupt=1 so navigation still kills running jobs.
+      const fd = new FormData();
+      fd.append("file", song.file);
+      fd.append("interrupt", "1");
+      r = await api("/api/upload", { method: "POST", body: fd });
+    } else {
+      r = await postJSON("/api/load_path", { path: song.path });
+    }
     setLog("Loaded " + r.input.name);
     poll(true);
   } catch (e) {
@@ -1601,6 +1675,42 @@ $("btn-shuffle").addEventListener("click", () => {
 $("queue-prev").addEventListener("click", prevSong);
 $("queue-next").addEventListener("click", nextSong);
 $("queue-clear").addEventListener("click", clearQueue);
+
+/* ---- drop OS audio files onto the queue panel to enqueue them ---- */
+const QUEUE_DROP_EXTS = ["wav", "mp3", "flac", "m4a", "ogg", "aac", "aiff", "opus"];
+
+function enqueueFiles(files) {
+  let added = 0;
+  for (const f of files) {
+    const ext = (f.name.split(".").pop() || "").toLowerCase();
+    if (!QUEUE_DROP_EXTS.includes(ext)) continue;
+    playlist.queue.push({ file: f, name: f.name.replace(/\.[^.]+$/, ""), local: true });
+    added++;
+  }
+  if (added) { renderQueue(); setLog("Queued " + added + " local file" + (added > 1 ? "s" : "")); }
+  else setLog("No audio files in that drop", true);
+}
+
+// Drop OS audio files onto the queue panel. Mirrors the #dropzone handlers: preventDefault
+// + highlight on every drag-over (reorder is pointer-based, so no HTML5 drag to filter out).
+(() => {
+  const panel = $("panel-queue");
+  const over = (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    panel.classList.add("drag");
+  };
+  panel.addEventListener("dragenter", over);
+  panel.addEventListener("dragover", over);
+  panel.addEventListener("dragleave", (e) => {
+    if (!panel.contains(e.relatedTarget)) panel.classList.remove("drag");
+  });
+  panel.addEventListener("drop", (e) => {
+    e.preventDefault();
+    panel.classList.remove("drag");
+    if (e.dataTransfer.files.length) enqueueFiles(e.dataTransfer.files);
+  });
+})();
 
 /* ---- library modal: folder picker + song browser ---- */
 let browseDir = "";

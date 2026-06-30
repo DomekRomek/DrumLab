@@ -352,10 +352,18 @@ button:disabled { opacity: 0.4; cursor: default; }
 .queue-row {
   display: flex; align-items: center; gap: 6px;
   background: var(--panel2); border: 1px solid var(--line); border-radius: 4px;
-  padding: 3px 6px; font-size: 11px; cursor: pointer;
+  padding: 3px 6px; font-size: 11px; cursor: grab;
+  user-select: none; touch-action: none;   /* drag to reorder, don't select text / scroll */
 }
 .queue-row:hover { border-color: var(--accent); }
 .queue-row.next { border-color: var(--accent); }
+/* while reordering: non-dragged rows glide aside; the dragged row tracks the pointer 1:1 */
+#queue-list.reordering .queue-row { transition: transform 0.12s ease; }
+#queue-list.reordering .queue-row.dragging {
+  transition: none; position: relative; z-index: 2; cursor: grabbing; opacity: 0.92;
+  border-color: var(--accent); box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
+}
+#panel-queue.drag { border-color: var(--accent); background: rgba(78, 161, 255, 0.10); }
 .queue-row .qr-text { flex: 1; min-width: 0; }
 .queue-row .qr-name {
   color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
