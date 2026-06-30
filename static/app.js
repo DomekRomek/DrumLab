@@ -727,8 +727,12 @@ async function ensureAudio() {
 }
 
 async function togglePlay() {
-  // Nothing loaded — no audio lanes and no transcribed MIDI — so play does nothing.
-  if (!engine.duration && Tone.Transport.state !== "started") return;
+  // Nothing loaded — no audio lanes and no transcribed MIDI. If a song is queued, load
+  // and play it (poll() starts playback once its lane finishes); otherwise do nothing.
+  if (!engine.duration && Tone.Transport.state !== "started") {
+    if (playlist.queue.length && !playlist.loading) { playlist.autoplay = true; nextSong(); }
+    return;
+  }
   await ensureAudio();
   if (Tone.Transport.state === "started") {
     Tone.Transport.pause();
@@ -1458,6 +1462,7 @@ const playlist = {
   current: null,      // the song currently loaded via the queue (null if uploaded manually)
   party: false,
   loading: false,
+  autoplay: false,    // pressing play with nothing loaded but a queued song: play it once loaded
 };
 
 function updateShuffleBtn() {
@@ -1484,7 +1489,7 @@ function renderQueue() {
   list.innerHTML = "";
   q.forEach((song, i) => {
     const row = document.createElement("div");
-    row.className = "queue-row" + (i === 0 ? " next" : "");
+    row.className = "queue-row";
     row.title = "Drag to reorder · click to load " + song.name + (song.artist ? " — " + song.artist : "");
     const txt = document.createElement("div");
     txt.className = "qr-text";
@@ -1609,6 +1614,7 @@ async function loadSong(song) {
     poll(true);
   } catch (e) {
     setLog("Load failed: " + e.message, true);
+    playlist.autoplay = false;   // don't auto-play a later load because this one failed
   } finally {
     playlist.loading = false;
     renderQueue();
@@ -2121,7 +2127,11 @@ async function poll(fast) {
       const wasPlaying = Tone.Transport.state === "started";
       seekAll(0);
       loadLane("input", "/api/audio/input?v=" + s.input.id)
-        .then(() => { if (wasPlaying) seekAll(0); })
+        .then(() => {
+          // Play pressed with an empty engine queued a song — start it now that it's loaded.
+          if (playlist.autoplay) { playlist.autoplay = false; togglePlay(); }
+          else if (wasPlaying) seekAll(0);
+        })
         .catch((e) => setLog("Waveform failed: " + e.message, true));
       renderStemLanes();  // reset stem lanes to placeholders for the current selection
     }

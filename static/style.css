@@ -347,7 +347,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 .q-mini svg { display: block; }  /* center the folder icon like the × glyph, no baseline gap */
 #queue-list {
   display: flex; flex-direction: column; gap: 3px;
-  max-height: 176px; overflow-y: auto; min-height: 0;
+  max-height: 210px; overflow-y: auto; min-height: 0;
 }
 .queue-row {
   display: flex; align-items: center; gap: 6px;
