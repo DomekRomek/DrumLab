@@ -727,6 +727,8 @@ async function ensureAudio() {
 }
 
 async function togglePlay() {
+  // Nothing loaded — no audio lanes and no transcribed MIDI — so play does nothing.
+  if (!engine.duration && Tone.Transport.state !== "started") return;
   await ensureAudio();
   if (Tone.Transport.state === "started") {
     Tone.Transport.pause();
