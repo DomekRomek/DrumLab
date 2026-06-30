@@ -1424,13 +1424,17 @@ function renderInputMeta(input) {
     fmtDur(input.duration),
     fmtSize(input.size || 0),
   ];
-  // Prefer the embedded title; the filename is only a fallback for untagged files.
-  const title = input.title || input.name;
-  const who = input.artist || input.album_artist;
-  const detail = [input.album, input.year, input.genre].filter(Boolean).join("  ·  ");
-  $("meta-display").textContent = title + "  ·  " + parts.join(" · ");
-  $("file-name").textContent = title;
-  setTagLines($("file-tags"), [who, detail]);
+  // Headline reads "Album Artist - Album - Title" from the tags, dropping any piece
+  // that's missing; with no tags at all it falls back to the filename.
+  const who = input.album_artist || input.artist;
+  const name = [who, input.album, input.title].filter(Boolean).join(" - ") || input.name;
+  // Secondary line: Track N · year · genre · …  (track number stripped of leading zeros).
+  const track = input.track && /^\d+$/.test(input.track) ? String(+input.track) : input.track;
+  const detail = [track ? "Track " + track : null, input.year, input.genre]
+    .filter(Boolean).join("  ·  ");
+  $("meta-display").textContent = name + "  ·  " + parts.join(" · ");
+  $("file-name").textContent = name;
+  setTagLines($("file-tags"), [detail]);
   $("file-meta").textContent = parts.join(" · ");
   if (input.art) {
     dz.classList.add("has-art");
