@@ -15,9 +15,11 @@
   <div class="hdr-left">
     <h1>DrumLab</h1>
     <div id="transport">
-      <button id="btn-play" class="t-play" title="Play / pause (space)">&#9654;</button>
-      <button id="btn-stop" class="t-stop" title="Stop and return to start"><svg width="13" height="13" viewBox="0 0 13 13"><rect width="13" height="13" rx="2" fill="currentColor"/></svg></button>
-      <div class="hdr-group" title="Playlist — party shuffle and song library">
+      <div class="hdr-group" title="Transport — play / pause and stop">
+        <button id="btn-play" class="t-play" title="Play / pause (space)">&#9654;</button>
+        <button id="btn-stop" class="t-stop" title="Stop and return to start"><svg width="13" height="13" viewBox="0 0 13 13"><rect width="13" height="13" rx="2" fill="currentColor"/></svg></button>
+      </div>
+      <div class="hdr-group spaced" title="Playlist — party shuffle, previous / next">
         <button id="btn-shuffle" class="hdr-icon off" disabled title="Select a library folder to enable party shuffle">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="16 3 21 3 21 8"/>
@@ -28,11 +30,8 @@
             <line class="slash" x1="3" y1="3" x2="21" y2="21"/>
           </svg>
         </button>
-        <button id="btn-library" class="hdr-icon subtle" title="Song library — pick a folder, then add songs to the up-next queue">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 7a2 2 0 0 1 2-2h3.5l2 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
-          </svg>
-        </button>
+        <button id="queue-prev" class="hdr-icon" title="Load the previous song (back through play history)" disabled>&#9198;</button>
+        <button id="queue-next" class="hdr-icon" title="Load the next song in the queue" disabled>&#9197;</button>
       </div>
       <span id="time-display" title="Transport position">0:00.000</span>
     </div>
@@ -89,8 +88,11 @@
     <h2>Up Next</h2>
     <div class="queue-head">
       <span id="queue-count" class="hint"></span>
-      <button id="queue-prev" class="q-mini" title="Load the previous song (back through play history)" disabled>&#9198;</button>
-      <button id="queue-next" class="q-mini" title="Load the next song in the queue" disabled>&#9197;</button>
+      <button id="btn-library" class="q-mini" title="Song library — pick a folder, then add songs to the up-next queue">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7a2 2 0 0 1 2-2h3.5l2 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+        </svg>
+      </button>
       <button id="queue-clear" class="q-mini" title="Clear the queue" disabled>&#10005;</button>
     </div>
     <div id="queue-list"></div>

@@ -313,14 +313,16 @@ button:disabled { opacity: 0.4; cursor: default; }
    with a clear gap so the CUDA/CPU seg and the sample rows read as separate groups */
 .input-right .sample-pad { flex: none; margin-top: 21px; }
 
-/* ---- header shuffle / library icon buttons (live in #transport) ---- */
-/* shuffle + library read as one segmented pill, set apart from play/stop */
+/* ---- header button pills (live in #transport) ---- */
+/* play+stop, and shuffle+prev+next, each read as one segmented pill */
 .hdr-group {
   display: inline-flex; align-items: center;
   border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
 }
-.hdr-group .hdr-icon { border-radius: 0; }
-.hdr-group .hdr-icon + .hdr-icon { border-left: 1px solid var(--line); }
+.hdr-group > button { border-radius: 0; }
+.hdr-group > button + button { border-left: 1px solid var(--line); }
+/* extra breathing room between the transport pill and the playlist pill */
+.hdr-group.spaced { margin-left: 12px; }
 .hdr-icon {
   display: inline-flex; align-items: center; justify-content: center;
   background: var(--panel2); color: var(--dim);
@@ -330,8 +332,6 @@ button:disabled { opacity: 0.4; cursor: default; }
 #btn-shuffle .slash { display: none; }
 #btn-shuffle.off .slash { display: inline; }
 #btn-shuffle.on { background: var(--accent); color: #0d1117; }
-/* library: subtly accent-tinted so it doesn't compete with play/stop */
-.hdr-icon.subtle { color: var(--accent); }
 
 /* ---- up-next queue (sits where the sample pad used to, right of input) ---- */
 .queue-head {
@@ -344,6 +344,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 }
 .q-mini:not(:disabled):hover { border-color: var(--accent); color: var(--accent); }
 .q-mini:disabled { opacity: 0.4; cursor: default; }
+.q-mini svg { display: block; }  /* center the folder icon like the × glyph, no baseline gap */
 #queue-list {
   display: flex; flex-direction: column; gap: 3px;
   max-height: 176px; overflow-y: auto; min-height: 0;
