@@ -2001,8 +2001,16 @@ async function poll(fast) {
       $("out-tempo").textContent = "";
       $("out-bpm").value = "";
       $("zoom").value = 0;  // fit the whole new file
+      // The transport keeps running while the new file decodes, so by the time the lane
+      // renders the needle has crept forward (and the new song starts mid-way). Pin it
+      // back to 0 once loading finishes so a track change always plays from the top.
+      // Capture this BEFORE seekAll(0): it restarts with start("+0.03"), so for ~30 ms
+      // afterwards Transport.state still reads "paused" and the flag would be false.
+      const wasPlaying = Tone.Transport.state === "started";
       seekAll(0);
-      loadLane("input", "/api/audio/input?v=" + s.input.id).catch((e) => setLog("Waveform failed: " + e.message, true));
+      loadLane("input", "/api/audio/input?v=" + s.input.id)
+        .then(() => { if (wasPlaying) seekAll(0); })
+        .catch((e) => setLog("Waveform failed: " + e.message, true));
       renderStemLanes();  // reset stem lanes to placeholders for the current selection
     }
     if (s.stems && s.stems.key !== lastStemKey) {
