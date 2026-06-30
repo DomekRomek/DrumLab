@@ -1392,11 +1392,25 @@ function fmtDur(sec) {
   return m + ":" + String(s).padStart(2, "0");
 }
 
+// Render each non-empty string as its own text line; hide the box if all are empty.
+// textContent (never innerHTML) keeps file-tag values from being parsed as markup.
+function setTagLines(el, lines) {
+  el.textContent = "";
+  for (const text of lines) {
+    if (!text) continue;
+    const row = document.createElement("div");
+    row.textContent = text;
+    el.appendChild(row);
+  }
+  el.classList.toggle("hidden", !el.childElementCount);
+}
+
 function renderInputMeta(input) {
   const dz = $("dropzone");
   if (!input) {
     $("meta-display").textContent = "No file loaded";
     $("file-name").innerHTML = "&nbsp;";
+    setTagLines($("file-tags"), []);
     $("file-meta").innerHTML = "&nbsp;";
     dz.classList.remove("has-art");
     dz.style.backgroundImage = "";
@@ -1410,8 +1424,13 @@ function renderInputMeta(input) {
     fmtDur(input.duration),
     fmtSize(input.size || 0),
   ];
-  $("meta-display").textContent = input.name + "  ·  " + parts.join(" · ");
-  $("file-name").textContent = input.name;
+  // Prefer the embedded title; the filename is only a fallback for untagged files.
+  const title = input.title || input.name;
+  const who = input.artist || input.album_artist;
+  const detail = [input.album, input.year, input.genre].filter(Boolean).join("  ·  ");
+  $("meta-display").textContent = title + "  ·  " + parts.join(" · ");
+  $("file-name").textContent = title;
+  setTagLines($("file-tags"), [who, detail]);
   $("file-meta").textContent = parts.join(" · ");
   if (input.art) {
     dz.classList.add("has-art");

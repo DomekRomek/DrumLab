@@ -33,7 +33,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "4.9"
+APP_VERSION = "4.10"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -559,6 +559,52 @@ def index():
     return Response(content=html.replace("__VER__", APP_VERSION), media_type="text/html")
 
 
+def probe_tags(path: Path) -> dict:
+    """Read container metadata tags (title / artist / album / year / ...) via ffprobe.
+
+    Returns only the recognised, non-empty fields; everything else is dropped. Tag keys
+    differ by container (ID3 vs Vorbis vs MP4), so lookups are case-insensitive with a few
+    aliases. Best-effort: any failure (untagged/exotic file, ffprobe missing) yields {} so
+    ingest never breaks on it. Run against the ORIGINAL upload -- the cached WAV is stripped."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path)],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=30,
+        )
+        raw = (json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+               .get("format", {}).get("tags", {})) if r.returncode == 0 else {}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+    tags = {str(k).lower(): str(v).strip() for k, v in (raw or {}).items()
+            if v not in (None, "")}
+
+    def pick(*keys):
+        for k in keys:
+            if tags.get(k):
+                return tags[k]
+        return None
+
+    year = None
+    date = pick("date", "year", "originalyear", "tyer", "tdrc")
+    if date:
+        m = re.search(r"\d{4}", date)
+        year = m.group(0) if m else None
+    track = pick("track", "trck")
+    if track:
+        track = track.split("/", 1)[0].strip() or None
+
+    out = {
+        "title": pick("title", "tit2"),
+        "artist": pick("artist", "tpe1", "author", "composer"),
+        "album": pick("album", "talb"),
+        "album_artist": pick("album_artist", "albumartist", "album artist", "tpe2"),
+        "genre": pick("genre", "tcon"),
+        "track": track,
+        "year": year,
+    }
+    return {k: v for k, v in out.items() if v}
+
+
 def ingest_audio(data: bytes, filename: str) -> dict:
     """Convert raw bytes of an audio file to a cached WAV, extract metadata + art, and
     install it as STATE["input"]. Keyed on the content hash, so re-ingesting the same
@@ -595,6 +641,8 @@ def ingest_audio(data: bytes, filename: str) -> dict:
         if r.returncode != 0 or not art.exists() or art.stat().st_size == 0:
             art.unlink(missing_ok=True)
 
+    tags = probe_tags(orig)
+
     with STATE_LOCK:
         STATE["input"] = {
             "id": sha, "name": filename, "stem_name": safe_stem,
@@ -602,6 +650,7 @@ def ingest_audio(data: bytes, filename: str) -> dict:
             "samplerate": int(info.samplerate), "channels": int(info.channels),
             "ext": suffix.lstrip(".").lower(), "size": len(data),
             "art": art.exists(),
+            **tags,
         }
         STATE["stems"] = None
         STATE["acts"] = None
