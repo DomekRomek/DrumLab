@@ -33,7 +33,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "4.10"
+APP_VERSION = "4.11"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -564,19 +564,27 @@ def probe_tags(path: Path) -> dict:
 
     Returns only the recognised, non-empty fields; everything else is dropped. Tag keys
     differ by container (ID3 vs Vorbis vs MP4), so lookups are case-insensitive with a few
-    aliases. Best-effort: any failure (untagged/exotic file, ffprobe missing) yields {} so
-    ingest never breaks on it. Run against the ORIGINAL upload -- the cached WAV is stripped."""
+    aliases. Crucially the tags live in different places too: MP3/MP4 put them in the
+    container (format.tags), but Ogg/FLAC carry Vorbis comments on the audio STREAM, so we
+    merge both (container wins on conflict). Best-effort: any failure (untagged/exotic file,
+    ffprobe missing) yields {} so ingest never breaks. Run against the ORIGINAL upload --
+    the cached WAV is tag-stripped."""
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path)],
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", str(path)],
             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=30,
         )
-        raw = (json.loads(r.stdout.decode("utf-8", "replace") or "{}")
-               .get("format", {}).get("tags", {})) if r.returncode == 0 else {}
+        data = json.loads(r.stdout.decode("utf-8", "replace") or "{}") if r.returncode == 0 else {}
     except (OSError, ValueError, subprocess.SubprocessError):
         return {}
-    tags = {str(k).lower(): str(v).strip() for k, v in (raw or {}).items()
-            if v not in (None, "")}
+    audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), {})
+    tags = {}
+    # stream tags first, then the container overlays them so a populated container wins
+    for src in (audio.get("tags"), data.get("format", {}).get("tags")):
+        for k, v in (src or {}).items():
+            if v not in (None, ""):
+                tags[str(k).lower()] = str(v).strip()
 
     def pick(*keys):
         for k in keys:
