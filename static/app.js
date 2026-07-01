@@ -1431,9 +1431,9 @@ function renderInputMeta(input) {
   const track = input.track && /^\d+$/.test(input.track) ? String(+input.track) : input.track;
   const detail = [track ? "Track " + track : null, input.year, input.genre]
     .filter(Boolean).join("  ·  ");
-  // The format string (OGG · 44.1 kHz · …) lives only in the header now; the input
-  // panel shows just the name + tag lines so it isn't duplicated.
-  $("meta-display").textContent = name + "  ·  " + parts.join(" · ");
+  // Header shows the raw filename + format; the input panel carries the pretty
+  // "Album Artist - Album - Title" headline and the tag lines instead.
+  $("meta-display").textContent = input.name + "  ·  " + parts.join(" · ");
   $("file-name").textContent = name;
   setTagLines($("file-tags"), [detail]);
   if (input.art) {
