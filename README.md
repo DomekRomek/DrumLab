@@ -122,13 +122,12 @@ This starts the server on `127.0.0.1:8765` and opens it in your default browser.
 | `--host ADDR` | bind address (default `127.0.0.1`; `0.0.0.0` to expose on your LAN) |
 | `--no-browser` | don't open a browser window |
 | `--preload` | download all Demucs models, then exit |
-| `--library FOLDER` | index a folder for the song library / party shuffle (repeatable; defaults to your **Music** folder when launched via `run.ps1`) |
+| `--library FOLDER` | index a folder for the song library / party shuffle (repeatable) |
 
 > **Song library.** The party-shuffle / up-next browser indexes folders you point it at.
-> `run.ps1` defaults this to your Windows **Music** folder — edit the `-Library` parameter at
-> the top of `run.ps1` to point elsewhere, pass `.\run.ps1 -Library 'D:\Music'` for a one-off,
-> or set it to `''` to start empty and pick a folder from the UI. Launching `app.py` directly,
-> use `--library FOLDER` (repeatable).
+> Pass `--library FOLDER` (repeatable) to index one or more folders at startup — e.g.
+> `python app.py --library "D:\Music"` — or start without it and pick a folder from the UI.
+> With no library configured the browser just starts empty.
 
 > **Single shared workspace.** DrumLab is a single-user tool: the server keeps one
 > global state (current song, stems, transcription). Every browser that connects —
