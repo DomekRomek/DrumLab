@@ -1411,7 +1411,6 @@ function renderInputMeta(input) {
     $("meta-display").textContent = "No file loaded";
     $("file-name").innerHTML = "&nbsp;";
     setTagLines($("file-tags"), []);
-    $("file-meta").innerHTML = "&nbsp;";
     dz.classList.remove("has-art");
     dz.style.backgroundImage = "";
     return;
@@ -1432,10 +1431,11 @@ function renderInputMeta(input) {
   const track = input.track && /^\d+$/.test(input.track) ? String(+input.track) : input.track;
   const detail = [track ? "Track " + track : null, input.year, input.genre]
     .filter(Boolean).join("  ·  ");
+  // The format string (OGG · 44.1 kHz · …) lives only in the header now; the input
+  // panel shows just the name + tag lines so it isn't duplicated.
   $("meta-display").textContent = name + "  ·  " + parts.join(" · ");
   $("file-name").textContent = name;
   setTagLines($("file-tags"), [detail]);
-  $("file-meta").textContent = parts.join(" · ");
   if (input.art) {
     dz.classList.add("has-art");
     dz.style.backgroundImage = "url(/api/art?v=" + input.id + ")";
