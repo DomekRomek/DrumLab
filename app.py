@@ -29,11 +29,11 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "4.1"
+APP_VERSION = "5.0"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -54,6 +54,8 @@ WORKER = APP_DIR / "adtof_worker.py"
 SOURCES = ["drums", "bass", "other", "vocals"]
 CH_NAMES = ["kick", "snare", "tom", "hihat", "cymbal"]
 DEFAULT_THRESHOLDS = {"kick": 0.22, "snare": 0.24, "tom": 0.32, "hihat": 0.22, "cymbal": 0.30}
+# Audio extensions the library scanner and the upload picker both accept.
+AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac", ".aiff", ".opus"}
 # Onset-latency compensation: the model's activation peaks a few frames AFTER the
 # real transient (spectrogram framing is center=True, so i/fps is otherwise exact),
 # so every picked hit lands late against the audio. Shift all onsets earlier by this
@@ -162,6 +164,19 @@ def reset_jobs() -> None:
         job.log.clear()
         job.cancelled = False
 
+
+def interrupt_jobs() -> None:
+    """Cancel any running pipeline jobs (separation, transcription) and wait for their
+    threads to tear down, so a newly chosen song can load right away. Navigating the
+    playlist -- Next/Prev or picking a library entry -- always wins over in-flight work.
+    Downloads are plain file responses, not Job slots, so they are unaffected."""
+    for job in (DEMUCS_JOB, ADTOF_JOB):
+        job.cancel()
+    for job in (DEMUCS_JOB, ADTOF_JOB):
+        t = job.thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=10)
+
 STATE_LOCK = threading.Lock()
 # Single global workspace, NOT per-client. DrumLab is a single-user tool, so every
 # connected browser (second tab, or a phone when bound with --host 0.0.0.0) shares this
@@ -176,6 +191,13 @@ STATE = {
 }
 PICK_REV = [0]
 ACTS_RAM: "OrderedDict[str, np.ndarray]" = OrderedDict()  # small LRU of activation arrays
+
+# On-disk song library for the playlist / party shuffle. Roots come from --library and/or
+# the in-UI folder picker; the scan is cached until roots change or a refresh is requested.
+# RAM-only and single-user, same as STATE -- nothing is persisted across restarts. The
+# queue itself lives client-side (app.js); the server only indexes files and loads one.
+LIBRARY_LOCK = threading.Lock()
+LIBRARY: dict = {"roots": [], "cache": None}  # roots: list[Path]; cache: list[song] | None
 
 
 def sha1_file(path: Path) -> str:
@@ -537,16 +559,70 @@ def index():
     return Response(content=html.replace("__VER__", APP_VERSION), media_type="text/html")
 
 
-@app.post("/api/upload")
-def upload(file: UploadFile = File(...)):
-    if DEMUCS_JOB.status == "running" or ADTOF_JOB.status == "running":
-        raise HTTPException(409, "A job is running -- stop it before changing the input")
-    data = file.file.read()
+def probe_tags(path: Path) -> dict:
+    """Read container metadata tags (title / artist / album / year / ...) via ffprobe.
+
+    Returns only the recognised, non-empty fields; everything else is dropped. Tag keys
+    differ by container (ID3 vs Vorbis vs MP4), so lookups are case-insensitive with a few
+    aliases. Crucially the tags live in different places too: MP3/MP4 put them in the
+    container (format.tags), but Ogg/FLAC carry Vorbis comments on the audio STREAM, so we
+    merge both (container wins on conflict). Best-effort: any failure (untagged/exotic file,
+    ffprobe missing) yields {} so ingest never breaks. Run against the ORIGINAL upload --
+    the cached WAV is tag-stripped."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", str(path)],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=30,
+        )
+        data = json.loads(r.stdout.decode("utf-8", "replace") or "{}") if r.returncode == 0 else {}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+    audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), {})
+    tags = {}
+    # stream tags first, then the container overlays them so a populated container wins
+    for src in (audio.get("tags"), data.get("format", {}).get("tags")):
+        for k, v in (src or {}).items():
+            if v not in (None, ""):
+                tags[str(k).lower()] = str(v).strip()
+
+    def pick(*keys):
+        for k in keys:
+            if tags.get(k):
+                return tags[k]
+        return None
+
+    year = None
+    date = pick("date", "year", "originalyear", "tyer", "tdrc")
+    if date:
+        m = re.search(r"\d{4}", date)
+        year = m.group(0) if m else None
+    track = pick("track", "trck")
+    if track:
+        track = track.split("/", 1)[0].strip() or None
+
+    out = {
+        "title": pick("title", "tit2"),
+        "artist": pick("artist", "tpe1", "author", "composer"),
+        "album": pick("album", "talb"),
+        "album_artist": pick("album_artist", "albumartist", "album artist", "tpe2"),
+        "genre": pick("genre", "tcon"),
+        "track": track,
+        "year": year,
+    }
+    return {k: v for k, v in out.items() if v}
+
+
+def ingest_audio(data: bytes, filename: str) -> dict:
+    """Convert raw bytes of an audio file to a cached WAV, extract metadata + art, and
+    install it as STATE["input"]. Keyed on the content hash, so re-ingesting the same
+    bytes (uploaded twice, or uploaded once and later loaded from the library) reuses the
+    cached WAV. Shared by /api/upload and /api/load_path. Returns the new input dict."""
     if not data:
         raise HTTPException(400, "Empty upload")
     sha = hashlib.sha1(data).hexdigest()[:16]
-    safe_stem = re.sub(r"[^\w\-. ]+", "_", Path(file.filename or "input").stem)[:60] or "input"
-    suffix = Path(file.filename or "input.bin").suffix or ".bin"
+    safe_stem = re.sub(r"[^\w\-. ]+", "_", Path(filename or "input").stem)[:60] or "input"
+    suffix = Path(filename or "input.bin").suffix or ".bin"
     orig = UPLOADS / f"{sha}_orig{suffix}"
     orig.write_bytes(data)
     wav = UPLOADS / f"{sha}.wav"
@@ -573,20 +649,159 @@ def upload(file: UploadFile = File(...)):
         if r.returncode != 0 or not art.exists() or art.stat().st_size == 0:
             art.unlink(missing_ok=True)
 
+    tags = probe_tags(orig)
+
     with STATE_LOCK:
         STATE["input"] = {
-            "id": sha, "name": file.filename, "stem_name": safe_stem,
+            "id": sha, "name": filename, "stem_name": safe_stem,
             "wav": str(wav), "duration": duration,
             "samplerate": int(info.samplerate), "channels": int(info.channels),
             "ext": suffix.lstrip(".").lower(), "size": len(data),
             "art": art.exists(),
+            **tags,
         }
         STATE["stems"] = None
         STATE["acts"] = None
         STATE["pick"] = None
         STATE["tempo_override"] = None
     reset_jobs()
-    return {"input": STATE["input"]}
+    return STATE["input"]
+
+
+@app.post("/api/upload")
+def upload(file: UploadFile = File(...), interrupt: str = Form("")):
+    # interrupt=1 marks a playlist-queue load of a dropped local file: navigation always
+    # wins, so cancel running jobs (like load_path) instead of refusing with a 409. The
+    # manual dropzone sends no flag and keeps the guard. See interrupt_jobs().
+    if interrupt:
+        interrupt_jobs()
+    elif DEMUCS_JOB.status == "running" or ADTOF_JOB.status == "running":
+        raise HTTPException(409, "A job is running -- stop it before changing the input")
+    return {"input": ingest_audio(file.file.read(), file.filename or "input")}
+
+
+@app.post("/api/load_path")
+def load_path(params: dict):
+    """Load a song from the on-disk library (by absolute path) into STATE["input"].
+    The path must resolve to a file inside a configured library root (traversal guard).
+    Navigating the playlist interrupts any running separation/transcription -- navigation
+    always wins. Downloads are not jobs, so they keep running. See interrupt_jobs()."""
+    src = library_file(params.get("path", ""))  # validate the path before killing anything
+    interrupt_jobs()
+    return {"input": ingest_audio(src.read_bytes(), src.name)}
+
+
+def add_library_root(path: str) -> Path:
+    """Resolve and register a library root folder. Raises HTTPException on a bad path."""
+    try:
+        p = Path(path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(400, f"Folder not found: {path}")
+    if not p.is_dir():
+        raise HTTPException(400, f"Not a folder: {path}")
+    with LIBRARY_LOCK:
+        if p not in LIBRARY["roots"]:
+            LIBRARY["roots"].append(p)
+        LIBRARY["cache"] = None
+    return p
+
+
+def scan_library() -> list:
+    """Walk every root and return audio files as {path, name, artist}, sorted by
+    (artist, name). 'artist' is the file's immediate parent-folder name -- the per-folder
+    grouping the user organises their library by."""
+    with LIBRARY_LOCK:
+        roots = list(LIBRARY["roots"])
+    out, seen = [], set()
+    for root in roots:
+        try:
+            walk = sorted(root.rglob("*"), key=lambda f: str(f).lower())
+        except OSError:
+            continue
+        for f in walk:
+            if f.suffix.lower() not in AUDIO_EXTS:
+                continue
+            try:
+                if not f.is_file():
+                    continue
+            except OSError:
+                continue
+            key = str(f).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"path": str(f), "name": f.stem, "artist": f.parent.name or root.name})
+    out.sort(key=lambda e: (e["artist"].lower(), e["name"].lower()))
+    return out
+
+
+def library_file(path: str) -> Path:
+    """Validate a client-supplied path: it must resolve to an existing audio file inside a
+    configured root. Guards against traversal / loading arbitrary files off the disk."""
+    if not path:
+        raise HTTPException(400, "No path given")
+    try:
+        p = Path(path).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(404, "File not found")
+    with LIBRARY_LOCK:
+        roots = list(LIBRARY["roots"])
+    if not any(p.is_relative_to(r) for r in roots):
+        raise HTTPException(403, "Path is outside the library")
+    if not p.is_file() or p.suffix.lower() not in AUDIO_EXTS:
+        raise HTTPException(400, "Not a library audio file")
+    return p
+
+
+@app.get("/api/library")
+def get_library(refresh: int = 0):
+    """The indexed song list plus whether any root is configured (drives the UI's
+    shuffle-enabled state). Cached until roots change or refresh=1."""
+    with LIBRARY_LOCK:
+        configured = bool(LIBRARY["roots"])
+        cached = LIBRARY["cache"]
+        roots = [str(r) for r in LIBRARY["roots"]]
+    if cached is None or refresh:
+        cached = scan_library()
+        with LIBRARY_LOCK:
+            LIBRARY["cache"] = cached
+    return {"configured": configured, "roots": roots, "songs": cached}
+
+
+@app.post("/api/library/roots")
+def add_root(params: dict):
+    """Register a library root chosen via the in-UI folder picker, then rescan."""
+    add_library_root(params.get("path", ""))
+    return get_library(refresh=1)
+
+
+@app.get("/api/browse")
+def browse(dir: str = ""):
+    """List the subfolders of `dir` (home folder when empty) so the UI folder picker can
+    navigate the disk. Directories only; also returns drive roots on Windows."""
+    p = Path(dir).expanduser() if dir else Path.home()
+    try:
+        p = p.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        p = Path.home()
+    if not p.is_dir():
+        p = p.parent if p.parent.is_dir() else Path.home()
+    dirs = []
+    try:
+        for child in sorted(p.iterdir(), key=lambda c: c.name.lower()):
+            try:
+                if child.is_dir() and not child.name.startswith("."):
+                    dirs.append({"name": child.name, "path": str(child)})
+            except OSError:
+                continue
+    except OSError:
+        raise HTTPException(403, "Cannot read that folder")
+    drives = []
+    if os.name == "nt":
+        import string
+        drives = [f"{c}:\\" for c in string.ascii_uppercase if Path(f"{c}:\\").exists()]
+    return {"dir": str(p), "parent": "" if p.parent == p else str(p.parent),
+            "dirs": dirs, "drives": drives}
 
 
 @app.post("/api/demucs/run")
@@ -1013,10 +1228,19 @@ def main() -> None:
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--preload", action="store_true",
                     help="Download all Demucs models, then exit")
+    ap.add_argument("--library", action="append", default=[], metavar="FOLDER",
+                    help="Folder to index for the song library / party shuffle "
+                         "(repeatable). If omitted, pick one from the UI.")
     args = ap.parse_args()
 
     if args.preload:
         sys.exit(preload_models())
+
+    for root in args.library:
+        try:
+            print(f"Library root: {add_library_root(root)}")
+        except HTTPException as e:
+            print(f"  warning: --library {root}: {e.detail}")
 
     url = f"http://{args.host}:{args.port}"
     # 0.0.0.0/:: are bind-only wildcards; open a loopback URL in the browser instead.

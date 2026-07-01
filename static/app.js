@@ -281,10 +281,11 @@ const classGains = {};
 for (const c of CLASSES) classGains[c.id] = new Tone.Gain(CLASS_TRIM[c.id]).connect(midiBus);
 
 // track mixer state; node gain = knob gain, gated by mute/solo.
-// the separated stems sit at 0 dB but start muted — unmute to hear them.
+// input starts muted but soloed: you hear the raw input first, un-solo it to
+// drop to the unmuted stems + MIDI mix. solo wins over mute, so input is audible.
 const mix = { midi: { gain: 1, mute: false, solo: false, node: midiBus } };
 for (const k of LANE_NAMES) {
-  mix[k] = { gain: 1, mute: k !== "input", solo: false, node: laneGains[k] };
+  mix[k] = { gain: 1, mute: k === "input", solo: k === "input", node: laneGains[k] };
 }
 
 const MIX_TRACKS = [...LANE_NAMES, "midi"];
@@ -318,7 +319,8 @@ function bindMuteSolo(track) {
   });
 }
 for (const t of MIX_TRACKS) bindMuteSolo(t);
-for (const t of STEM_LANES) $("mute-" + t).classList.add("active");  // stems start muted
+$("mute-input").classList.add("active");   // input starts muted...
+$("solo-input").classList.add("active");   // ...but soloed, so it's what you hear first
 
 const taps = { master: makeTap(master), midi: makeTap(midiBus) };
 for (const k of LANE_NAMES) taps[k] = makeTap(laneGains[k]);
@@ -725,6 +727,12 @@ async function ensureAudio() {
 }
 
 async function togglePlay() {
+  // Nothing loaded — no audio lanes and no transcribed MIDI. If a song is queued, load
+  // and play it (poll() starts playback once its lane finishes); otherwise do nothing.
+  if (!engine.duration && Tone.Transport.state !== "started") {
+    if (playlist.queue.length && !playlist.loading) { playlist.autoplay = true; nextSong(); }
+    return;
+  }
   await ensureAudio();
   if (Tone.Transport.state === "started") {
     Tone.Transport.pause();
@@ -1384,12 +1392,25 @@ function fmtDur(sec) {
   return m + ":" + String(s).padStart(2, "0");
 }
 
+// Render each non-empty string as its own text line; hide the box if all are empty.
+// textContent (never innerHTML) keeps file-tag values from being parsed as markup.
+function setTagLines(el, lines) {
+  el.textContent = "";
+  for (const text of lines) {
+    if (!text) continue;
+    const row = document.createElement("div");
+    row.textContent = text;
+    el.appendChild(row);
+  }
+  el.classList.toggle("hidden", !el.childElementCount);
+}
+
 function renderInputMeta(input) {
   const dz = $("dropzone");
   if (!input) {
     $("meta-display").textContent = "No file loaded";
     $("file-name").innerHTML = "&nbsp;";
-    $("file-meta").innerHTML = "&nbsp;";
+    setTagLines($("file-tags"), []);
     dz.classList.remove("has-art");
     dz.style.backgroundImage = "";
     return;
@@ -1402,9 +1423,19 @@ function renderInputMeta(input) {
     fmtDur(input.duration),
     fmtSize(input.size || 0),
   ];
+  // Headline reads "Album Artist - Album - Title" from the tags, dropping any piece
+  // that's missing; with no tags at all it falls back to the filename.
+  const who = input.album_artist || input.artist;
+  const name = [who, input.album, input.title].filter(Boolean).join(" - ") || input.name;
+  // Secondary line: Track N · year · genre · …  (track number stripped of leading zeros).
+  const track = input.track && /^\d+$/.test(input.track) ? String(+input.track) : input.track;
+  const detail = [track ? "Track " + track : null, input.year, input.genre]
+    .filter(Boolean).join("  ·  ");
+  // Header shows the raw filename + format; the input panel carries the pretty
+  // "Album Artist - Album - Title" headline and the tag lines instead.
   $("meta-display").textContent = input.name + "  ·  " + parts.join(" · ");
-  $("file-name").textContent = input.name;
-  $("file-meta").textContent = parts.join(" · ");
+  $("file-name").textContent = name;
+  setTagLines($("file-tags"), [detail]);
   if (input.art) {
     dz.classList.add("has-art");
     dz.style.backgroundImage = "url(/api/art?v=" + input.id + ")";
@@ -1437,6 +1468,388 @@ $("dropzone").addEventListener("drop", (e) => {
   e.preventDefault();
   $("dropzone").classList.remove("drag");
   doUpload(e.dataTransfer.files[0]);
+});
+
+/* ------------------------------------------------------------------ */
+/* library / playlist — party shuffle + curated queue, RAM only        */
+/* ------------------------------------------------------------------ */
+// The queue lives entirely client-side; the server only indexes files (/api/library)
+// and loads one by path (/api/load_path, which feeds the same poll() refresh as upload).
+const PARTY_TARGET = 5;   // keep at least this many songs queued while party shuffle is on
+const HISTORY_MAX = 5;    // how many previously-played songs Prev can step back through
+const playlist = {
+  songs: [],          // [{path, name, artist}] — the indexed library
+  configured: false,  // any --library / picked root present?
+  queue: [],          // upcoming [{path,name,artist}]; index 0 = the next to load
+  history: [],        // previously-played songs, most-recent-last (cap HISTORY_MAX)
+  current: null,      // the song currently loaded via the queue (null if uploaded manually)
+  party: false,
+  loading: false,
+  autoplay: false,    // pressing play with nothing loaded but a queued song: play it once loaded
+};
+
+function updateShuffleBtn() {
+  const btn = $("btn-shuffle");
+  const on = playlist.party && playlist.configured;
+  btn.disabled = !playlist.configured;
+  btn.classList.toggle("on", on);
+  btn.classList.toggle("off", !on);
+  btn.title = !playlist.configured
+    ? "Select a library folder to enable party shuffle"
+    : playlist.party
+      ? "Party shuffle ON — auto-queuing random songs. Click to turn off."
+      : "Party shuffle OFF — click to auto-queue random songs from your library.";
+}
+
+function renderQueue() {
+  const list = $("queue-list");
+  const q = playlist.queue;
+  $("queue-count").textContent = q.length ? q.length + " queued" : "";
+  $("queue-prev").disabled = playlist.history.length === 0 || playlist.loading;
+  $("queue-next").disabled = q.length === 0 || playlist.loading;
+  $("queue-clear").disabled = q.length === 0;
+  $("queue-empty").classList.toggle("hidden", q.length > 0);
+  list.innerHTML = "";
+  q.forEach((song, i) => {
+    const row = document.createElement("div");
+    row.className = "queue-row";
+    row.title = "Drag to reorder · click to load " + song.name + (song.artist ? " — " + song.artist : "");
+    const txt = document.createElement("div");
+    txt.className = "qr-text";
+    const nm = document.createElement("div"); nm.className = "qr-name"; nm.textContent = song.name;
+    const ar = document.createElement("div"); ar.className = "qr-artist";
+    ar.textContent = song.artist || (song.local ? "local file" : "");
+    txt.appendChild(nm); txt.appendChild(ar);
+    const del = document.createElement("button");
+    del.className = "qr-del"; del.innerHTML = "&times;"; del.title = "Remove from queue";
+    del.addEventListener("click", (e) => { e.stopPropagation(); removeFromQueue(i); });
+    row.appendChild(txt); row.appendChild(del);
+    // Pointer-driven reorder; a press that doesn't move is treated as a click-to-load.
+    row.addEventListener("pointerdown", (e) => startReorder(e, i, row));
+    list.appendChild(row);
+  });
+}
+
+/* ---- smooth pointer-driven reorder (no native drag ghost / text cursor) ---- */
+let reorder = null;   // active drag: {fromIdx,targetIdx,pointerId,rowEl,startY,moved,centers,step}
+
+function startReorder(e, idx, rowEl) {
+  if (e.pointerType === "mouse" && e.button !== 0) return;  // left button only
+  if (e.target.closest(".qr-del")) return;                  // let the × button work
+  const rows = [...$("queue-list").children];
+  const centers = rows.map((r) => { const b = r.getBoundingClientRect(); return b.top + b.height / 2; });
+  reorder = {
+    fromIdx: idx, targetIdx: idx, pointerId: e.pointerId, rowEl,
+    startY: e.clientY, moved: false, centers,
+    step: centers.length > 1 ? centers[1] - centers[0] : rowEl.getBoundingClientRect().height + 3,
+  };
+  try { rowEl.setPointerCapture(e.pointerId); } catch (_) {}
+  rowEl.addEventListener("pointermove", onReorderMove);
+  rowEl.addEventListener("pointerup", endReorder);
+  rowEl.addEventListener("pointercancel", endReorder);
+}
+
+function onReorderMove(e) {
+  if (!reorder || e.pointerId !== reorder.pointerId) return;
+  const dy = e.clientY - reorder.startY;
+  if (!reorder.moved && Math.abs(dy) < 4) return;   // small jitter = still a click, not a drag
+  reorder.moved = true;
+  e.preventDefault();
+  $("queue-list").classList.add("reordering");
+  reorder.rowEl.classList.add("dragging");
+  reorder.rowEl.style.transform = `translateY(${dy}px)`;
+  // target = how many other rows now sit above the dragged row's centre = its post-removal index
+  const draggedCenter = reorder.centers[reorder.fromIdx] + dy;
+  let target = 0;
+  for (let k = 0; k < reorder.centers.length; k++) {
+    if (k !== reorder.fromIdx && reorder.centers[k] < draggedCenter) target++;
+  }
+  reorder.targetIdx = target;
+  // slide the other rows to open a gap where the dragged row will land
+  [...$("queue-list").children].forEach((r, k) => {
+    if (k === reorder.fromIdx) return;
+    let shift = 0;
+    if (target > reorder.fromIdx && k > reorder.fromIdx && k <= target) shift = -reorder.step;
+    else if (target < reorder.fromIdx && k >= target && k < reorder.fromIdx) shift = reorder.step;
+    r.style.transform = shift ? `translateY(${shift}px)` : "";
+  });
+}
+
+function endReorder(e) {
+  if (!reorder || e.pointerId !== reorder.pointerId) return;
+  const { rowEl, fromIdx, targetIdx, moved } = reorder;
+  rowEl.removeEventListener("pointermove", onReorderMove);
+  rowEl.removeEventListener("pointerup", endReorder);
+  rowEl.removeEventListener("pointercancel", endReorder);
+  try { rowEl.releasePointerCapture(reorder.pointerId); } catch (_) {}
+  reorder = null;
+  $("queue-list").classList.remove("reordering");
+  if (e.type === "pointercancel") { renderQueue(); return; }   // aborted — reset, don't commit
+  if (!moved) { loadFromQueue(fromIdx); return; }              // a tap → load it
+  if (targetIdx !== fromIdx) {
+    const item = playlist.queue.splice(fromIdx, 1)[0];
+    playlist.queue.splice(targetIdx, 0, item);
+  }
+  renderQueue();   // rebuild clean (clears the inline transforms)
+}
+
+function partyFill() {
+  if (!playlist.party || !playlist.songs.length) return;
+  const queued = new Set(playlist.queue.map((s) => s.path));
+  const allowDupes = playlist.songs.length <= PARTY_TARGET;
+  let guard = 0;
+  while (playlist.queue.length < PARTY_TARGET && guard++ < 1000) {
+    const pick = playlist.songs[Math.floor(Math.random() * playlist.songs.length)];
+    if (queued.has(pick.path) && !allowDupes) continue;
+    queued.add(pick.path);
+    playlist.queue.push(pick);
+  }
+}
+
+function enqueue(song) { playlist.queue.push(song); renderQueue(); }
+
+function removeFromQueue(i) {
+  playlist.queue.splice(i, 1);
+  partyFill();
+  renderQueue();
+}
+
+function clearQueue() { playlist.queue = []; renderQueue(); }
+
+async function loadSong(song) {
+  if (playlist.loading) return;
+  playlist.loading = true;
+  chainAdtof = null;   // dropping the old song cancels any separation->transcription chain
+  renderQueue();
+  $("file-name").textContent = "Loading " + song.name + " …";
+  try {
+    let r;
+    if (song.file) {
+      // a dropped local file: upload it. interrupt=1 so navigation still kills running jobs.
+      const fd = new FormData();
+      fd.append("file", song.file);
+      fd.append("interrupt", "1");
+      r = await api("/api/upload", { method: "POST", body: fd });
+    } else {
+      r = await postJSON("/api/load_path", { path: song.path });
+    }
+    setLog("Loaded " + r.input.name);
+    poll(true);
+  } catch (e) {
+    setLog("Load failed: " + e.message, true);
+    playlist.autoplay = false;   // don't auto-play a later load because this one failed
+  } finally {
+    playlist.loading = false;
+    renderQueue();
+  }
+}
+
+// Make `song` the current track; the song it replaces moves onto the history stack.
+function goToSong(song) {
+  if (playlist.current) {
+    playlist.history.push(playlist.current);
+    if (playlist.history.length > HISTORY_MAX) playlist.history.shift();
+  }
+  playlist.current = song;
+  renderQueue();
+  loadSong(song);
+}
+
+function loadFromQueue(i) {
+  if (playlist.loading) return;
+  const song = playlist.queue[i];
+  if (!song) return;
+  playlist.queue.splice(0, i + 1);   // drop the chosen song and any you skipped past
+  partyFill();
+  goToSong(song);
+}
+
+function nextSong() {
+  if (playlist.loading) return;
+  if (!playlist.queue.length) partyFill();
+  if (playlist.queue.length) loadFromQueue(0);
+}
+
+// Step back to the previously-played song; the current one returns to the queue front,
+// keeping Prev/Next symmetric.
+function prevSong() {
+  if (playlist.loading || !playlist.history.length) return;
+  const song = playlist.history.pop();
+  if (playlist.current) playlist.queue.unshift(playlist.current);
+  playlist.current = song;
+  renderQueue();
+  loadSong(song);
+}
+
+async function loadLibrary(refresh) {
+  try {
+    const lib = await api("/api/library" + (refresh ? "?refresh=1" : ""));
+    playlist.songs = lib.songs || [];
+    playlist.configured = !!lib.configured;
+    if (!playlist.configured) playlist.party = false;
+    updateShuffleBtn();
+    renderQueue();
+    if (!$("library-songs").classList.contains("hidden")) renderSongList();
+    return lib;
+  } catch (e) {
+    setLog("Library: " + e.message, true);
+  }
+}
+
+$("btn-shuffle").addEventListener("click", () => {
+  if (!playlist.configured) return;
+  playlist.party = !playlist.party;
+  if (playlist.party) partyFill();
+  updateShuffleBtn();
+  renderQueue();
+});
+$("queue-prev").addEventListener("click", prevSong);
+$("queue-next").addEventListener("click", nextSong);
+$("queue-clear").addEventListener("click", clearQueue);
+
+/* ---- drop OS audio files onto the queue panel to enqueue them ---- */
+const QUEUE_DROP_EXTS = ["wav", "mp3", "flac", "m4a", "ogg", "aac", "aiff", "opus"];
+
+function enqueueFiles(files) {
+  let added = 0;
+  for (const f of files) {
+    const ext = (f.name.split(".").pop() || "").toLowerCase();
+    if (!QUEUE_DROP_EXTS.includes(ext)) continue;
+    playlist.queue.push({ file: f, name: f.name.replace(/\.[^.]+$/, ""), local: true });
+    added++;
+  }
+  if (added) { renderQueue(); setLog("Queued " + added + " local file" + (added > 1 ? "s" : "")); }
+  else setLog("No audio files in that drop", true);
+}
+
+// Drop OS audio files onto the queue panel. Mirrors the #dropzone handlers: preventDefault
+// + highlight on every drag-over (reorder is pointer-based, so no HTML5 drag to filter out).
+(() => {
+  const panel = $("panel-queue");
+  const over = (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    panel.classList.add("drag");
+  };
+  panel.addEventListener("dragenter", over);
+  panel.addEventListener("dragover", over);
+  panel.addEventListener("dragleave", (e) => {
+    if (!panel.contains(e.relatedTarget)) panel.classList.remove("drag");
+  });
+  panel.addEventListener("drop", (e) => {
+    e.preventDefault();
+    panel.classList.remove("drag");
+    if (e.dataTransfer.files.length) enqueueFiles(e.dataTransfer.files);
+  });
+})();
+
+/* ---- library modal: folder picker + song browser ---- */
+let browseDir = "";
+
+function openLibrary() {
+  $("library-modal").classList.remove("hidden");
+  if (playlist.configured) showSongsView(); else showBrowseView();
+}
+function closeLibrary() { $("library-modal").classList.add("hidden"); }
+
+function showBrowseView(dir) {
+  $("library-title").textContent = "Pick a music folder";
+  $("library-browse").classList.remove("hidden");
+  $("library-songs").classList.add("hidden");
+  browseTo(dir || "");
+}
+function showSongsView() {
+  $("library-title").textContent = "Library — click a song to queue it";
+  $("library-browse").classList.add("hidden");
+  $("library-songs").classList.remove("hidden");
+  renderSongList();
+}
+
+function browseItem(iconEntity, label, onClick) {
+  const el = document.createElement("div");
+  el.className = "browse-item";
+  const ico = document.createElement("span");
+  ico.className = "bi-ico"; ico.innerHTML = iconEntity;
+  el.appendChild(ico);
+  el.appendChild(document.createTextNode(label));
+  el.addEventListener("click", onClick);
+  return el;
+}
+
+async function browseTo(dir) {
+  try {
+    const b = await api("/api/browse?dir=" + encodeURIComponent(dir || ""));
+    browseDir = b.dir;
+    $("browse-path").textContent = b.dir;
+    const dr = $("browse-drives");
+    dr.innerHTML = "";
+    (b.drives || []).forEach((d) => {
+      const chip = document.createElement("button");
+      chip.className = "drive-chip"; chip.textContent = d;
+      chip.addEventListener("click", () => browseTo(d));
+      dr.appendChild(chip);
+    });
+    const list = $("browse-list");
+    list.innerHTML = "";
+    if (b.parent) list.appendChild(browseItem("&#8593;", " ..", () => browseTo(b.parent)));
+    b.dirs.forEach((d) => list.appendChild(browseItem("&#128193;", " " + d.name, () => browseTo(d.path))));
+    if (!b.dirs.length && !b.parent) {
+      const e = document.createElement("div"); e.className = "hint"; e.textContent = "No sub-folders here.";
+      list.appendChild(e);
+    }
+  } catch (e) {
+    setLog("Browse: " + e.message, true);
+  }
+}
+
+async function useFolder() {
+  if (!browseDir) return;
+  try {
+    await postJSON("/api/library/roots", { path: browseDir });
+    await loadLibrary();   // server already rescanned on add; fetch the new list
+    showSongsView();
+    setLog("Library folder added: " + browseDir);
+  } catch (e) {
+    setLog("Library: " + e.message, true);
+  }
+}
+
+function renderSongList() {
+  const list = $("song-list");
+  const q = ($("song-search").value || "").toLowerCase();
+  list.innerHTML = "";
+  let lastArtist = null, shown = 0;
+  playlist.songs.forEach((song) => {
+    if (q && !(song.name.toLowerCase().includes(q) || (song.artist || "").toLowerCase().includes(q))) return;
+    if (song.artist !== lastArtist) {
+      lastArtist = song.artist;
+      const g = document.createElement("div");
+      g.className = "song-group"; g.textContent = song.artist || "—";
+      list.appendChild(g);
+    }
+    const el = document.createElement("div");
+    el.className = "song-item"; el.title = "Add to queue";
+    const nm = document.createElement("span"); nm.className = "si-name"; nm.textContent = song.name;
+    el.appendChild(nm);
+    el.addEventListener("click", () => { enqueue(song); setLog("Queued " + song.name); });
+    list.appendChild(el);
+    shown++;
+  });
+  if (!shown) {
+    const e = document.createElement("div"); e.className = "hint";
+    e.textContent = playlist.songs.length ? "No matches." : "No audio files found in this folder.";
+    list.appendChild(e);
+  }
+}
+
+$("btn-library").addEventListener("click", openLibrary);
+$("library-close").addEventListener("click", closeLibrary);
+$("library-changedir").addEventListener("click", () => showBrowseView(browseDir));
+$("browse-use").addEventListener("click", useFolder);
+$("song-search").addEventListener("input", renderSongList);
+$("library-modal").addEventListener("click", (e) => { if (e.target === $("library-modal")) closeLibrary(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("library-modal").classList.contains("hidden")) closeLibrary();
 });
 
 /* ------------------------------------------------------------------ */
@@ -1729,8 +2142,20 @@ async function poll(fast) {
       $("out-tempo").textContent = "";
       $("out-bpm").value = "";
       $("zoom").value = 0;  // fit the whole new file
+      // The transport keeps running while the new file decodes, so by the time the lane
+      // renders the needle has crept forward (and the new song starts mid-way). Pin it
+      // back to 0 once loading finishes so a track change always plays from the top.
+      // Capture this BEFORE seekAll(0): it restarts with start("+0.03"), so for ~30 ms
+      // afterwards Transport.state still reads "paused" and the flag would be false.
+      const wasPlaying = Tone.Transport.state === "started";
       seekAll(0);
-      loadLane("input", "/api/audio/input?v=" + s.input.id).catch((e) => setLog("Waveform failed: " + e.message, true));
+      loadLane("input", "/api/audio/input?v=" + s.input.id)
+        .then(() => {
+          // Play pressed with an empty engine queued a song — start it now that it's loaded.
+          if (playlist.autoplay) { playlist.autoplay = false; togglePlay(); }
+          else if (wasPlaying) seekAll(0);
+        })
+        .catch((e) => setLog("Waveform failed: " + e.message, true));
       renderStemLanes();  // reset stem lanes to placeholders for the current selection
     }
     if (s.stems && s.stems.key !== lastStemKey) {
@@ -1817,5 +2242,6 @@ applyMix();
 renderStemLanes();   // show placeholder lanes for the default selection
 applyZoom();
 poll(true);
+loadLibrary();       // index any --library roots; enables party shuffle if configured
 requestAnimationFrame(raf);
 setLog("DrumLab ready — drop a file to begin");
