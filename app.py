@@ -676,7 +676,7 @@ def probe_tags(path: Path) -> dict:
     return {k: v for k, v in out.items() if v}
 
 
-def ingest_audio(data: bytes, filename: str) -> dict:
+def ingest_audio(data: bytes, filename: str, src_path: Path | None = None) -> dict:
     """Convert raw bytes of an audio file to a cached WAV, extract metadata + art, and
     install it as STATE["input"]. Keyed on the content hash, so re-ingesting the same
     bytes (uploaded twice, or uploaded once and later loaded from the library) reuses the
@@ -704,13 +704,31 @@ def ingest_audio(data: bytes, filename: str) -> dict:
 
     # embedded album art (attached-pic stream), if any
     art = UPLOADS / f"{sha}_art.jpg"
+    just_extracted = False
     if not art.exists():
+        just_extracted = True
         r = subprocess.run(
             ["ffmpeg", "-y", "-i", str(orig), "-an", "-map", "0:v:0", "-frames:v", "1", str(art)],
             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=60,
         )
         if r.returncode != 0 or not art.exists() or art.stat().st_size == 0:
             art.unlink(missing_ok=True)
+    # True only when embedded art was freshly extracted THIS run; a pre-existing
+    # cache file may be a stale fallback copy that the mtime re-copy below fixes.
+    have_embedded = art.exists()
+    # No embedded art (or the folder has a cover file that's newer than the
+    # cache): fall back to a cover-image file next to the source, copied into
+    # uploads so /api/art can serve it. Disabled by --no-art-fallback. The
+    # mtime re-copy also recovers from a wrong pick, since the cache slot is
+    # content-hash keyed and would otherwise stick forever.
+    if ART_FALLBACK and src_path is not None and not (have_embedded and just_extracted):
+        cover = find_cover_fallback(src_path)
+        if cover is not None and (not art.exists()
+                                  or cover.stat().st_mtime > art.stat().st_mtime):
+            try:
+                shutil.copyfile(cover, art)
+            except OSError:
+                pass
 
     tags = probe_tags(orig)
 
@@ -751,7 +769,7 @@ def load_path(params: dict):
     always wins. Downloads are not jobs, so they keep running. See interrupt_jobs()."""
     src = library_file(params.get("path", ""))  # validate the path before killing anything
     interrupt_jobs()
-    return {"input": ingest_audio(src.read_bytes(), src.name)}
+    return {"input": ingest_audio(src.read_bytes(), src.name, src_path=src)}
 
 
 def add_library_root(path: str) -> Path:
@@ -1352,10 +1370,16 @@ def main() -> None:
     ap.add_argument("--library", action="append", default=[], metavar="FOLDER",
                     help="Folder to index for the song library / party shuffle "
                          "(repeatable). If omitted, pick one from the UI.")
+    ap.add_argument("--no-art-fallback", action="store_true",
+                    help="Don't fall back to a cover image file (cover.jpg, folder.png, "
+                         "...) in the track's folder when a song has no embedded art.")
     args = ap.parse_args()
 
     if args.preload:
         sys.exit(preload_models())
+
+    global ART_FALLBACK
+    ART_FALLBACK = not args.no_art_fallback
 
     if args.port is None:
         args.port = _first_free_port(args.host, 8765)

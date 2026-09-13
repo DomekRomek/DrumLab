@@ -8,3 +8,6 @@ fastapi
 uvicorn
 python-multipart
 music21
+pretty_midi
+soundfile
+librosa
