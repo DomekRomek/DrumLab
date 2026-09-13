@@ -13,12 +13,14 @@ LAYOUT OF workdir/ (created next to this file, safe to delete to clear caches):
 """
 
 import argparse
+import atexit
 import hashlib
 import importlib.util
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -359,7 +361,7 @@ def demucs_thread(params: dict) -> None:
         ]
         if segment:
             cmd += ["--segment", str(int(segment))]
-        cmd.append(inp["wav"])
+        cmd.append(_ensure_input_wav())
 
         job.message = f"Separating with {model} on {device} ..."
         rc = stream_subprocess(job, cmd)
@@ -452,7 +454,7 @@ def adtof_thread(params: dict) -> None:
             if not STATE["input"]:
                 job.finish("error", "No input file uploaded")
                 return
-            wav = Path(STATE["input"]["wav"])
+            wav = Path(_ensure_input_wav())
 
         job.message = "Hashing source audio ..."
         key = f"{sha1_file(wav)}_fps{fps}"
@@ -1026,7 +1028,7 @@ def _ensure_backing(parts: list) -> tuple:
 @app.get("/api/audio/{which}")
 def get_audio(which: str, parts: Optional[str] = None):
     if which == "input" and STATE["input"]:
-        return FileResponse(STATE["input"]["wav"], media_type="audio/wav")
+        return FileResponse(_ensure_input_wav(), media_type="audio/wav")
     if which == "backing":
         path, _ = _ensure_backing(_parse_parts(parts))
         return FileResponse(str(path), media_type="audio/wav", headers={"Cache-Control": "no-store"})
@@ -1079,7 +1081,7 @@ def _stretch_tag() -> str:
 def _lane_source(lane: str, parts: Optional[str] = None):
     """(source wav path, stable cache key) for a playback lane, or 404/409."""
     if lane == "input" and STATE["input"]:
-        return STATE["input"]["wav"], STATE["input"]["id"]
+        return _ensure_input_wav(), STATE["input"]["id"]
     if lane == "backing":
         path, bkey = _ensure_backing(_parse_parts(parts))
         return str(path), bkey
@@ -1152,7 +1154,11 @@ def audio_chunk(lane: str, i: int, speed: float = 1.0, parts: Optional[str] = No
 @app.get("/api/art")
 def get_art():
     if STATE["input"] and STATE["input"].get("art"):
-        return FileResponse(UPLOADS / f"{STATE['input']['id']}_art.jpg", media_type="image/jpeg")
+        art = UPLOADS / f"{STATE['input']['id']}_art.jpg"
+        if not art.exists():
+            _ensure_input_wav()   # also rebuilds the art slot from _orig
+        if art.exists():
+            return FileResponse(art, media_type="image/jpeg")
     raise HTTPException(404, "No album art")
 
 
@@ -1206,7 +1212,7 @@ def _render_stem(which: str, fmt: str, speed: float, parts: Optional[str]) -> tu
     if which == "input":
         if not STATE["input"]:
             raise HTTPException(409, "No input loaded")
-        src = str(STATE["input"]["wav"])
+        src = _ensure_input_wav()
         skey = STATE["input"]["id"]
     elif which == "backing":
         src, skey = _ensure_backing(_parse_parts(parts))
@@ -1358,7 +1364,70 @@ def _first_free_port(host: str, start: int) -> int:
     raise SystemExit(f"No free port in {start}-{start + 99}")
 
 
+def cleanup_uploads() -> None:
+    """Wipe workdir/uploads/ on shutdown, keeping the {sha}_orig.* source copies.
+
+    Everything else (converted WAVs, art cache) is regenerated on demand from
+    the _orig file (see _ensure_input_wav / get_art). Errors are swallowed:
+    losing the cache is fine, crashing at shutdown is not.
+    """
+    try:
+        if not UPLOADS.exists():
+            return
+        for p in UPLOADS.iterdir():
+            if "_orig" in p.name:
+                continue
+            try:
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+            except OSError:
+                pass
+        print(f"Cleaned {UPLOADS}")
+    except OSError as e:
+        print(f"warning: could not clean {UPLOADS}: {e}")
+
+
+def _reconvert_input(sha: str, wav: Path, art: Path) -> None:
+    """Rebuild the converted WAV (and art) from the kept {sha}_orig.* source."""
+    origs = list(UPLOADS.glob(f"{sha}_orig.*"))
+    if not origs:
+        raise HTTPException(500, "Input WAV missing and no cached source to reconvert from; reload the track")
+    orig = origs[0]
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(orig), "-vn", "-acodec", "pcm_s16le", str(wav)],
+        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=300,
+    )
+    if r.returncode != 0 or not wav.exists():
+        raise HTTPException(500, "Reconvert failed: " + r.stderr.decode("utf-8", "replace")[-300:])
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(orig), "-an", "-map", "0:v:0", "-frames:v", "1", str(art)],
+        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=60,
+    )
+    if r.returncode != 0 or not art.exists() or art.stat().st_size == 0:
+        art.unlink(missing_ok=True)
+
+
+def _ensure_input_wav() -> str:
+    """STATE['input']['wav'] path, reconverted from the _orig source if cleanup removed it."""
+    inp = STATE["input"]
+    wav = Path(inp["wav"])
+    if not wav.exists():
+        sha = inp["id"]
+        _reconvert_input(sha, wav, UPLOADS / f"{sha}_art.jpg")
+    return str(wav)
+
+
+def _sigterm_handler(signum, frame) -> None:
+    # uvicorn captures SIGTERM, shuts down gracefully, restores this handler
+    # and re-raises the signal (uvicorn.server.capture_signals). Raising
+    # SystemExit here turns that re-raise into a normal exit so the atexit
+    # cleanup runs; without it the process dies on SIG_DFL (exit 143) and
+    # workdir/uploads/ is never cleaned.
+    raise SystemExit(0)
+
+
 def main() -> None:
+    atexit.register(cleanup_uploads)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
     ap = argparse.ArgumentParser(description="DrumLab -- local drum transcription GUI")
     ap.add_argument("--port", type=int, default=None,
                     help="Port to bind (default: first free port from 8765)")
