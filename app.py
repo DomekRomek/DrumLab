@@ -73,7 +73,51 @@ ONSET_COMP_SEC = 0.0
 GM_MAP = {"kick": 36, "snare": 38, "hihat": 42, "tom": 45, "cymbal": 49}
 GRID_Q = {"1/8": Fraction(1, 2), "1/16": Fraction(1, 4), "1/16T": Fraction(1, 6), "1/32": Fraction(1, 8)}
 
-CREATE_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+if os.name == "nt":
+    CREATE_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+else:
+    # POSIX: Windows-only creation flags don't exist; shim them to 0 so all
+    # later `creationflags=subprocess.CREATE_NO_WINDOW` references work as-is.
+    subprocess.CREATE_NEW_PROCESS_GROUP = 0
+    subprocess.CREATE_NO_WINDOW = 0
+    subprocess.BELOW_NORMAL_PRIORITY_CLASS = 0
+    CREATE_FLAGS = 0
+
+# Fallback album art: when a track has no embedded art, look for the usual
+# cover-image files in the same directory (set False with --no-art-fallback).
+ART_FALLBACK = True
+# Matched case-insensitively against files in the track's folder, in this
+# priority order (earlier wins: cover/front are album fronts, artist/fanart
+# may be band portraits but are kept for compatibility).
+_ART_FALLBACK_NAMES = (
+    "cover", "folder", "front", "album", "albumart", "art",
+    "artist", "poster", "thumbnail", "thumb", "fanart",
+)
+_ART_FALLBACK_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff")
+
+
+def find_cover_fallback(audio: Path) -> Path | None:
+    """Find an album-art file sitting next to `audio` (no embedded art case).
+    Matches the usual names (cover/folder/front/album...), case-insensitively
+    with space/_/- stripped, extensions jpg/png/webp/... Deterministic: the
+    name list is priority-ordered, and within one name, files are picked in
+    sorted order (so Cover.jpg beats cover.png only by filename stability,
+    not luck). Returns the path or None."""
+    try:
+        entries = sorted(audio.parent.iterdir(), key=lambda f: f.name.lower())
+    except OSError:
+        return None
+    candidates = {}
+    for f in entries:
+        if not f.is_file() or f.suffix.lower() not in _ART_FALLBACK_EXTS:
+            continue
+        stem = f.stem.lower().replace(" ", "").replace("_", "").replace("-", "")
+        if stem in _ART_FALLBACK_NAMES and stem not in candidates:
+            candidates[stem] = f
+    for name in _ART_FALLBACK_NAMES:
+        if name in candidates:
+            return candidates[name]
+    return None
 
 
 # ---------------------------------------------------------------------------
