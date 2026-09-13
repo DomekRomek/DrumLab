@@ -478,13 +478,35 @@ async function loadLane(name, url, chunkQuery) {
     cursorWidth: 1,
     normalize: false,
     interact: true,
-    autoScroll: true,
+    autoScroll: false,   // WS's own scrollIntoView fights our mirrorScroll (cursor jitter); we drive scrolling
     autoCenter: false,
     minPxPerSec: engine.pxPerSec,
     hideScrollbar: false,
   });
   ws.on("interaction", (t) => seekAll(t));
   ws.on("scroll", () => mirrorScroll(name));
+  // Firefox: per-frame clipPath updates on WS's canvas wrapper force full-layer
+  // re-raster -> visible shimmer of the painted region around the cursor.
+  // Chromium is fine (verified by pixel-diff). Skip the clipPath write on Gecko
+  // and let the cursor line carry progress rendering. The .progress overlay is
+  // a full-width duplicate waveform in progressColor; changing its width every
+  // frame makes Gecko re-raster it (measured: cursor toggle stops the shimmer),
+  // so on Gecko it is hidden and never updated.
+  const isGecko = CSS.supports("-moz-appearance", "none");
+  if (isGecko) {
+    const rend = ws.renderer;
+    const cw = rend.canvasWrapper || ws.getWrapper()?.querySelector(".canvases");
+    if (cw) cw.style.clipPath = "none";
+    const pw = rend.progressWrapper;
+    if (pw) pw.style.display = "none";   // duplicate waveform layer — Gecko re-raster source
+    rend.renderProgress = (t, e) => {
+      if (isNaN(t)) return;
+      const cur = rend.cursor;
+      cur.style.left = `${100 * t}%`;
+      cur.style.transform = `translateX(-${100 === Math.round(100 * t) ? ws.options.cursorWidth : 0}px)`;
+      if (rend.isScrollable && ws.options.autoScroll) rend.scrollIntoView(t, e);
+    };
+  }
   buildAmpAxis(cont);
   const sched = makeChunkScheduler(name, chunkQuery);
   if (_laneToken[name] !== token) {   // a newer load superseded this one
@@ -840,6 +862,13 @@ function updateCursors(t) {
   for (const k of LANE_NAMES) {
     const lane = engine.lanes[k];
     if (lane) { try { lane.ws.setTime(t); } catch (e) {} }
+  }
+  // playhead follow (single authority — WS autoScroll is off so it can't fight the
+  // mirror): jump scroll only when the cursor reaches the viewport's right edge.
+  const w = $("wave-input")?.clientWidth
+    || engine.lanes.input?.ws?.getWrapper()?.clientWidth;
+  if (w && t * engine.pxPerSec > roll.scrollPx + w - 4) {
+    setScrollAll(t * engine.pxPerSec - w / 2);   // put cursor mid-viewport
   }
 }
 
@@ -1508,7 +1537,7 @@ function drawRoll() {
     ctx.fillText(ROLL_LABEL[cls], 4, i * rowH + 11);
   }
 
-  const t = nowContent();
+  const t = nowContent();   // transport is extrapolated on the audio clock — already smooth
   const x = t * px - roll.scrollPx;
   if (x >= 0 && x <= W) {
     ctx.strokeStyle = "#e8e8e8";
