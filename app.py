@@ -36,7 +36,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "7.2"
+APP_VERSION = "7.3"
 APP_DIR = Path(__file__).resolve().parent
 WORK = APP_DIR / "workdir"
 UPLOADS = WORK / "uploads"
@@ -853,8 +853,25 @@ def get_library(refresh: int = 0):
 
 @app.post("/api/library/roots")
 def add_root(params: dict):
-    """Register a library root chosen via the in-UI folder picker, then rescan."""
-    add_library_root(params.get("path", ""))
+    """Register a library root chosen via the in-UI folder picker, then rescan.
+    replace=True makes it THE library root (clears previously picked ones) --
+    "change folder" semantics; --library CLI roots are also cleared by a replace."""
+    path = params.get("path", "")
+    # Validate BEFORE clearing anything, so a bad path can't wipe the library.
+    # (Empty path would resolve to the CWD -- reject it explicitly.)
+    if not path.strip():
+        raise HTTPException(400, "No folder given")
+    try:
+        new_root = Path(path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(400, f"Folder not found: {path}")
+    if not new_root.is_dir():
+        raise HTTPException(400, f"Not a folder: {path}")
+    if params.get("replace"):
+        with LIBRARY_LOCK:
+            LIBRARY["roots"] = []
+            LIBRARY["cache"] = None
+    add_library_root(str(new_root))
     return get_library(refresh=1)
 
 

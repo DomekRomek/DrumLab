@@ -2350,10 +2350,30 @@ async function browseTo(dir) {
   }
 }
 
+/* Persisted library root: a cookie is scoped to the HOST, not host:port, so it
+   survives the server auto-picking a different port (localStorage is per-origin
+   and would be lost). localStorage mirrors it for the same-origin fast path. */
+const LIB_ROOT_KEY = "drumlab_libroot";
+function saveLibRoot(path) {
+  try { localStorage.setItem(LIB_ROOT_KEY, path); } catch (e) {}
+  document.cookie = LIB_ROOT_KEY + "=" + encodeURIComponent(path) +
+    ";path=/;max-age=31536000;SameSite=Lax";
+}
+function getLibRoot() {
+  try {
+    const l = localStorage.getItem(LIB_ROOT_KEY);
+    if (l) return l;
+  } catch (e) {}
+  const m = document.cookie.match(new RegExp("(?:^|; )" + LIB_ROOT_KEY + "=([^;]*)"));
+  return m ? decodeURIComponent(m[1]) : "";
+}
+
 async function useFolder() {
   if (!browseDir) return;
   try {
-    await postJSON("/api/library/roots", { path: browseDir });
+    // replace: picking a folder makes it THE library (old roots dropped)
+    await postJSON("/api/library/roots", { path: browseDir, replace: true });
+    saveLibRoot(browseDir);
     await loadLibrary();   // server already rescanned on add; fetch the new list
     showSongsView();
     setLog("Library folder added: " + browseDir);
@@ -2852,6 +2872,18 @@ applyZoom();
 renderMetro();
 updateAutoplayBtn();
 poll(true);
-loadLibrary();       // index any --library roots; enables party shuffle if configured
+// Auto-restore the last-used library root when the server has none configured
+// (e.g. --library wasn't passed, or the server restarted on a new port).
+loadLibrary().then((lib) => {
+  if (!lib || !lib.configured) {
+    const saved = getLibRoot();
+    if (saved) {
+      postJSON("/api/library/roots", { path: saved, replace: true })
+        .then(() => loadLibrary())
+        .then(() => setLog("Library restored: " + saved))
+        .catch(() => setLog("Saved library folder not found: " + saved, true));
+    }
+  }
+});
 requestAnimationFrame(raf);
 setLog("DrumLab ready — drop a file to begin");
