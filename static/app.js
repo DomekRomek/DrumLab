@@ -864,10 +864,16 @@ function updateCursors(t) {
     if (lane) { try { lane.ws.setTime(t); } catch (e) {} }
   }
   // playhead follow (single authority — WS autoScroll is off so it can't fight the
-  // mirror): jump scroll only when the cursor reaches the viewport's right edge.
+  // mirror). Two modes: edge-jump (legacy) and pinned-at-1/3 (btn-follow).
   const w = $("wave-input")?.clientWidth
     || engine.lanes.input?.ws?.getWrapper()?.clientWidth;
-  if (w && t * engine.pxPerSec > roll.scrollPx + w - 4) {
+  if (!w) return;
+  if (follow.on) {
+    // keep the cursor at 1/3 of the viewport by scrolling the waveform leftwards.
+    // no deadband: at 180Hz the playhead moves <1px/frame, and a threshold there
+    // turns per-frame motion into visible steps. scrollLeft writes are cheap.
+    setScrollAll(t * engine.pxPerSec - w / 3);
+  } else if (t * engine.pxPerSec > roll.scrollPx + w - 4) {
     setScrollAll(t * engine.pxPerSec - w / 2);   // put cursor mid-viewport
   }
 }
@@ -2219,6 +2225,31 @@ function updateAutoplayBtn() {
 $("btn-autoplay").addEventListener("click", () => {
   playlist.autoNext = !playlist.autoNext;
   updateAutoplayBtn();
+});
+
+/* ---- follow-playhead toggle ---------------------------------------- */
+/* OFF: legacy edge-jump (scroll when the cursor hits the right edge).  */
+/* ON: the cursor stays pinned at 1/3 of the lane width and the         */
+/* waveform scrolls leftwards under it (DAW-style).                     */
+const follow = { on: false };
+function updateFollowBtn() {
+  const btn = $("btn-follow");
+  btn.classList.toggle("on", follow.on);
+  btn.classList.toggle("off", !follow.on);
+  btn.title = follow.on
+    ? "Follow ON — the cursor stays pinned at 1/3 of the lane and the waveform scrolls under it. Click to switch back to edge-jump scrolling."
+    : "Follow OFF — the view jumps when the cursor reaches the right edge. Click to pin the cursor at 1/3 of the lane and scroll the waveform under it.";
+}
+$("btn-follow").addEventListener("click", () => {
+  follow.on = !follow.on;
+  updateFollowBtn();
+  if (follow.on && Tone.Transport.state === "started") {
+    // snap the pinned cursor into place immediately
+    const c = nowContent();
+    const w = $("wave-input")?.clientWidth || engine.lanes.input?.ws?.getWrapper()?.clientWidth;
+    if (w) setScrollAll(c * engine.pxPerSec - w / 3);
+  }
+  setLog(follow.on ? "Playhead follow: pinned at 1/3" : "Playhead follow: edge-jump");
 });
 
 /* ---- drop OS audio files onto the queue panel to enqueue them ---- */
